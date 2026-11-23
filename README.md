@@ -77,7 +77,7 @@ These are HARPS RV time series fetched with `dace-query` and saved in Agatha's t
 independent of one another. `2D Periodogram` works on the raw data, except for its optional
 signal-only mode, which needs a `1D Periodogram` result for the same data sets. `N-body
 Stability` always needs a `1D Periodogram` result: it integrates the signals fitted there (the
-MAP of the MCMC when MCMC ran) and samples that run's MCMC. The diagnosis does not feed the
+highest-likelihood sample of the MCMC when MCMC ran) and samples that run's MCMC. The diagnosis does not feed the
 N-body tab, so when the diagnosis rejects a signal, re-run the 1D tab with matching settings
 before the N-body test. The same notes appear in bold at the top of each tab.
 
@@ -376,18 +376,18 @@ and the table can be downloaded. From R: `diagnose.signals()`, `diagnosis.table(
 
 ## 7. N-body stability
 
-The `N-body Stability` tab takes the planets of the current 1D solution (the MAP of the MCMC
+The `N-body Stability` tab takes the planets of the current 1D solution (the highest-likelihood sample of the MCMC
 when it ran, otherwise the maximum-likelihood fit; Keplerian or circular signals), a stellar
 mass and an inclination (coplanar orbits, m = m sin i / sin i), and tests whether the system
 survives:
 
 - analytically, for every adjacent pair: the AMD-stability of Laskar & Petit (2017) with the
   Hill limit of Petit, Laskar & Boue (2018), and the separation in mutual Hill radii;
-- numerically, with REBOUND's WHFast integrator (`scripts/nbody_rebound.py`; install with
-  `python3 -m pip install --user "rebound<5"`, version 5.1.1 has a broken wheel on macOS) for
+- numerically, with REBOUND's WHFast integrator (`scripts/nbody_rebound.py`; the current
+  locally verified environment is `.venv-nbody`, with REBOUND 4.6.0) for
   e.g. 10 Myr, or with a short-term leapfrog in R when Python or REBOUND are missing. A system
   is unstable at an escape, a close encounter within the chosen number of mutual Hill radii, a
-  drift of a semi-major axis beyond the tolerance, or e > 0.9. Either the nominal solution
+  drift of a semi-major axis beyond the tolerance. Exceeding e > 0.9 is a separate warning. Either the nominal solution
   alone or the nominal solution plus a Monte Carlo sample (rows of the MCMC posterior, or
   Gaussian draws from the 1-sigma quantiles) is integrated; the sample gives the fraction of
   stable systems as a function of time.
@@ -398,6 +398,11 @@ time to the system. The integration runs in a separate process (`scripts/nbody_r
 by `nbody.launch()`), so the app stays responsive; the progress bar follows the integration
 time of the current system, and `Stop` kills the job. From R: `rv2orbits()`, `amd.stability()`, `nbody.samples()`,
 `nbody.run()`, `nbody.classify()` and `nbody.plot()` in `nbody.R`.
+
+To recreate the isolated Python environment, run `python3 -m venv .venv-nbody` then
+`.venv-nbody/bin/python -m pip install rebound==4.6.0` from this directory. The GUI defaults
+to that environment when present. The recorded acceptance compares the actual driver initial
+state and roughly 0.1-year trajectories against R; it is not a long-term stability claim.
 
 ## 8. Figures
 
@@ -414,7 +419,7 @@ second cue) and a legend names the sets. The phase data downloaded from the app 
 index of every point in the column `set0`.
 
 A further panel, `Parameter table`, lists the fitted parameters of each observable: with an
-MCMC run the MAP value (the sample of maximum likelihood), the mean, the median and the 16 and
+MCMC run the highest-likelihood sample, the mean, the median and the 16 and
 84 per cent quantiles (the 1-sigma interval); without MCMC the maximum-likelihood values. It
 spans both columns of the figure grid, as does the `Model comparison` panel that follows it
 when signals were searched sequentially. Both are part of the on-screen figure and the
@@ -470,6 +475,13 @@ The behaviour is controlled by the arguments of `mcfit()` and `sigfit()`:
 `run.ptmcmc()` also accepts `adapt.ladder`, `adapt.window`, `adapt.nu`, `adapt.t0`,
 `max.extend` and `Rhat.max` for finer control.
 
+New GUI MCMC exports include `*_MCMCChains.csv` (posterior row, actual worker chain ID and
+retained draw index) and `*_MCMCDiagnostics.json` (available sampler settings and diagnostics).
+The draw index is not the original iteration number. The preserved `within_run_split_Rhat`
+is an internal split diagnostic, not an independent-chain rank/folded Rhat; ESS is not
+computed. These exports alone do not establish convergence. Old results lacking chain
+provenance are not assigned guessed IDs.
+
 With `Find additional signals sequentially`, each further signal is searched in the residual
 of the previous fit and compared with the model without it (see the next section). When MCMC
 is on, that residual is the data minus the signal of the maximum-likelihood MCMC sample of
@@ -491,8 +503,11 @@ A signal is accepted when `ln(BF)` exceeds the threshold `ln(BF) a further signa
 (default 5, i.e. odds of about 150:1). The search stops at the first rejected signal, whose
 periodogram is still shown; the combined model, the parameter table and the phase plots keep
 the accepted signals only. The most plausible number of signals is the number accepted, at
-most the maximum number searched. The `Model comparison` panel lists the periods, `ln(BF)`
-values and verdicts; from R the table is `out$model.comp[[observable]]` and the number
+most the maximum number searched. The `Model comparison` panel separates the period at the
+score's stage from the final fitted period and labels the score source. Final parameters do
+not redefine an earlier score. Individual phase panels retain sequential fits; the combined
+and residual panels use the final joint fit when available. From R the table is
+`out$model.comp[[observable]]` and the number
 `out$Nopt[[observable]]`. Periodogram types without a Bayes factor (MLP, GLS, ...) give no
 `ln(BF)` and their signals are accepted by default.
 

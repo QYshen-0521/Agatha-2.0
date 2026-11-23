@@ -51,6 +51,68 @@ agatha.dataset.name <- function(filename){
     return(name)
 }
 
+agatha.proxy.status <- function(tab,min.points=6L){
+###Values stay in their original columns. A partial proxy can have its own
+###periodogram but is never silently imputed for joint RV regression.
+    empty <- data.frame(index=integer(),name=character(),n.total=integer(),n.finite=integer(),
+                        status=character(),regression.usable=logical(),periodogram.usable=logical())
+    if(ncol(tab)<=3) return(empty)
+    rows <- lapply(seq_len(ncol(tab)-3L),function(j){
+        x <- tab[,j+3L]; ok <- is.finite(x) & is.finite(tab[,1])
+        n <- sum(ok); varying <- n>=2 && is.finite(sd(x[ok])) && sd(x[ok])>0
+        state <- if(n==0) 'all missing' else if(!varying) 'constant or insufficient data' else
+                 if(n<nrow(tab)) 'partially missing' else 'complete'
+        data.frame(index=j,name=colnames(tab)[j+3L],n.total=nrow(tab),n.finite=n,status=state,
+                   regression.usable=n==nrow(tab) && varying,
+                   periodogram.usable=n>=min.points && varying,stringsAsFactors=FALSE)
+    })
+    do.call(rbind,rows)
+}
+
+
+agatha.proxy.choices <- function(tab){
+###Keep original proxy indices; empty/unusable tables offer only None.
+    status <- agatha.proxy.status(tab)
+    use <- which(status$regression.usable)
+    if(length(use)==0L) return(c('None'=0))
+    c('None'=0,setNames(status$index[use],paste0(status$index[use],': ',status$name[use])))
+}
+
+agatha.proxy.options <- function(){
+###None is exclusive; real proxies remain multi-select for joint regression.
+    list(onItemAdd=I("function(value) {
+        if (value === '0') {
+            var control = this;
+            this.items.slice().forEach(function(item) {
+                if (item !== '0') control.removeItem(item);
+            });
+        } else if (this.items.indexOf('0') !== -1) {
+            this.removeItem('0');
+        }
+    }"))
+}
+
+agatha.select.indices <- function(tab,indices){
+###Fail explicitly when selected regressors are unusable; preserve every RV
+###row. Keep original proxy numbering even when other proxies are missing.
+    if(is.null(indices) || length(indices)==0) return(NULL)
+    if(any(!is.finite(indices)) || any(indices!=as.integer(indices)) || any(indices<0))
+        stop('Proxy indices must be non-negative integers.',call.=FALSE)
+    if(all(indices==0)) return(NULL)
+    indices <- unique(as.integer(indices[indices>0]))
+    status <- agatha.proxy.status(tab)
+    if(any(!indices%in%status$index)) stop('Selected proxy index is outside the input table.',call.=FALSE)
+    selected <- status[match(indices,status$index),,drop=FALSE]
+    if(any(!selected$regression.usable)){
+        bad <- selected[!selected$regression.usable,,drop=FALSE]
+        stop('Cannot regress RV on unavailable proxies: ',paste(paste0(bad$index,': ',bad$name,' (',bad$status,')'),collapse='; '),
+             '. Select complete, varying proxies; RV observations were not removed.',call.=FALSE)
+    }
+    values <- as.matrix(tab[,3L+indices,drop=FALSE])
+    for(j in seq_len(ncol(values))) values[,j] <- as.numeric(scale(values[,j]))
+    values
+}
+
 read.agatha.table <- function(path, center.rv=FALSE){
     first.row <- read.table(path,nrows=1,check.names=FALSE)
     has.header <- !is.numeric(first.row[1,1])
@@ -65,6 +127,9 @@ read.agatha.table <- function(path, center.rv=FALSE){
     if(ncol(tab)<3){
         tab$eRV <- rep(1,nrow(tab))
     }
+    if(any(!is.finite(as.matrix(tab[,1:3]))) || any(tab[,3]<=0)){
+        stop('Agatha requires finite time/RV values and finite, strictly positive uncertainties.',call.=FALSE)
+    }
     if(center.rv){
         tab[,2] <- tab[,2]-mean(tab[,2],na.rm=TRUE)
     }
@@ -73,13 +138,6 @@ read.agatha.table <- function(path, center.rv=FALSE){
     duplicate.time <- duplicated(tab[,1])
     if(any(duplicate.time)){
         tab <- tab[!duplicate.time,,drop=FALSE]
-    }
-    if(ncol(tab)>3){
-        for(j in 4:ncol(tab)){
-            if(is.na(sd(tab[,j])) || sd(tab[,j])==0){
-                tab[,j] <- abs(rnorm(nrow(tab),1,0.01))
-            }
-        }
     }
     if(!has.header || any(grepl('^V[[:digit:]]+$',colnames(tab)[1:min(3,ncol(tab))]))){
         colnames(tab)[1:3] <- c('Time','RV','eRV')
@@ -94,6 +152,7 @@ read.agatha.table <- function(path, center.rv=FALSE){
         }
     }
     rownames(tab) <- NULL
+    attr(tab,'proxy.status') <- agatha.proxy.status(tab)
     return(tab)
 }
 
@@ -156,6 +215,8 @@ addpar.stat <- function(stat.old,stat.new,nsig,keep=NULL){
 }
 
 calc.1Dper <- function(Nmax.plots, vars,per.par,data,Ncores=8,basis='natural'){
+    if(length(per.par$per.type)!=1L)
+        stop('Select one periodogram type per run. Run BFP and MLP separately to retain independent fits and exports.',call.=FALSE)
     var <- names(per.par)
     for(k in 1:length(var)){
         assign(var[k],per.par[[var[k]]])
@@ -194,6 +255,7 @@ calc.1Dper <- function(Nmax.plots, vars,per.par,data,Ncores=8,basis='natural'){
             mcf <- FALSE
         }
     }
+    data.status <- list()
     par.list <- sim.list <- phase.list <- per.list <- tits <- mc.list <- model.list <- list()
     tits <- c()
     fs <- c()
@@ -259,6 +321,17 @@ calc.1Dper <- function(Nmax.plots, vars,per.par,data,Ncores=8,basis='natural'){
             instrument <- per.target
             tab <- data[[per.target]]
         }
+###Each activity observable uses only its own actual finite measurements;
+###the full RV table is retained for the RV search and other observables.
+        n.input <- nrow(tab)
+        if(var!='Window Function' && var!=colnames(tab)[2]){
+            if(!var%in%colnames(tab)) stop('Unknown activity observable: ',var,call.=FALSE)
+            ok <- is.finite(tab[,1]) & is.finite(tab[,var])
+            if(sum(ok)<6 || !is.finite(sd(tab[ok,var])) || sd(tab[ok,var])==0)
+                stop('Activity observable ',var,' needs at least six finite, varying measurements.',call.=FALSE)
+            tab <- tab[ok,,drop=FALSE]
+        }
+        data.status[[var]] <- list(n.total=n.input,n.used=nrow(tab),finite.subset=nrow(tab)<n.input)
 ###array to store outputs
         per.data <- phase.data <- sim.data <- par.data <- c()
         cnames <- c()
@@ -270,14 +343,15 @@ calc.1Dper <- function(Nmax.plots, vars,per.par,data,Ncores=8,basis='natural'){
             Indices <- tab[,4:ncol(tab),drop=FALSE]
         }
         t <- tab[,1]
-        if(ypar==ns[1]){
+        if(ypar==colnames(tab)[2]){
             dy <- tab[,3]
         }else{
             dy <- rep(0.1,nrow(tab))
         }
+        if(per.type%in%c('BFP','MLP')) Indices <- agatha.select.indices(tab,Inds)
         if(ypar!='Window Function'){
             y <- tab[,ypar]
-            if(ypar!=ns[1]) y <- scale(y)
+            if(ypar!=colnames(tab)[2]) y <- scale(y)
             if(per.type=='GLST'){
                 rv.ls <- glst(t=tab[,1],y=y,err=dy,ofac=ofac,fmin=frange[1],fmax=frange[2])
                 ylab <- 'Power'
@@ -303,20 +377,7 @@ calc.1Dper <- function(Nmax.plots, vars,per.par,data,Ncores=8,basis='natural'){
 #                    quantify <- TRUE
 #                }
 
-###preselect Indices according to the value of Inds and Indices
-                if(length(Inds)>0){
-                    if(all(Inds==0)){
-                        Indices <- NULL
-                    }else{
-                        Inds <- Inds[Inds>0]
-                        Indices <- as.matrix(Indices[,Inds,drop=FALSE])
-                        for(j in 1:ncol(Indices)){
-                            Indices[,j] <- scale(Indices[,j])
-                        }
-                    }
-                }else{
-                    Indices <- NULL
-                }
+###Indices were validated and scaled once for both BFP and MLP above.
 #                tmp <- c(Nma=Nma,Nar=Nar,model.type='man',Indices=NULL,
 #                                                      ofac=ofac,fmin=frange[1],fmax=frange[2],quantify=quantify)
                 if(FALSE){
@@ -430,7 +491,9 @@ calc.1Dper <- function(Nmax.plots, vars,per.par,data,Ncores=8,basis='natural'){
             lnBF1 <- if(!is.null(rv.ls$lnBF.kepler) && is.finite(rv.ls$lnBF.kepler)) as.numeric(rv.ls$lnBF.kepler) else
                      if(per.type=='BFP') suppressWarnings(max(rv.ls$power,na.rm=TRUE)) else NA
             if(!is.finite(lnBF1)) lnBF1 <- NA
-            model.comp <- data.frame(n=1,P=as.numeric(fit$popt)[1],lnBF=lnBF1,source='periodogram',
+            score.source <- if(!is.null(rv.ls$lnBF.kepler) && is.finite(rv.ls$lnBF.kepler)) 'Keplerian' else 'periodogram'
+            score.period <- if(!is.finite(lnBF1)) NA_real_ else if(score.source=='Keplerian') as.numeric(fit$popt)[1] else rv.ls$P[which.max(rv.ls$power)]
+            model.comp <- data.frame(n=1,P=as.numeric(fit$popt)[1],P_score=as.numeric(score.period),lnBF=lnBF1,source=score.source,
                                      accepted=is.na(lnBF1) || lnBF1>lnBF.min,stringsAsFactors=FALSE)
         }
         llmax.prev <- if(is.null(fit$llmax)) NA else as.numeric(fit$llmax)
@@ -478,7 +541,13 @@ calc.1Dper <- function(Nmax.plots, vars,per.par,data,Ncores=8,basis='natural'){
             ParSig <- fit$ParSig
             par.data <- fit$par.stat
 
-            pp <- cbind(fit$ysig,fit$ysig0,fit$res)
+###Corrected observations retain the measured residuals. sigfit() names this
+###series `y`, while a joint mcfit() calls it `ysig`; `$ysig` on a sigfit
+###result partially matches `ysig0` and silently drops all residuals. Build
+###the common series explicitly for single-set, multi-set and joint fits.
+            signal <- fit[['ysig0',exact=TRUE]]
+            residual <- fit[['res',exact=TRUE]]
+            pp <- cbind(signal+residual,signal,residual)
             colnames(pp) <- paste0(c('y','ysig','res'),'_all')
             phase.data <- cbind(phase.data,pp)
             if(!is.null(fit$ysim.sig)){
@@ -518,6 +587,11 @@ calc.1Dper <- function(Nmax.plots, vars,per.par,data,Ncores=8,basis='natural'){
 ###the data-set names travel with the parameters so that tables can label them
         attr(par.data,'sets') <- per.target
         if(!is.null(model.comp)){
+            model.comp$P_final <- vapply(seq_len(nrow(model.comp)),function(k){
+                if(!isTRUE(model.comp$accepted[k])) return(NA_real_)
+                v <- reported.period(list(fit=par.data),'fit',model.comp$n[k])
+                if(is.null(v)) NA_real_ else v
+            },numeric(1))
             attr(model.comp,'lnBF.min') <- lnBF.min
             attr(model.comp,'Nsig.max') <- Nsig.max
         }
@@ -549,11 +623,24 @@ calc.1Dper <- function(Nmax.plots, vars,per.par,data,Ncores=8,basis='natural'){
     if(!exists('Inds')){
         Inds <- 0
     }
-    fname <- paste0(paste(per.target,collapse='_'),'_',paste(ypars,collapse='.'),'_',paste(per.type,collapse=''),'_AR',paste(Nar,collapse=''),'MA',paste(Nma,collapse=''),'_proxy',paste(Inds,collapse='.'),'_',Nsig.max,'sig_',paste(Pmaxs,collapse='d'),'d')
+    noise.tag <- if(GP) '_GP_SHO' else paste0('_AR',paste(Nar,collapse=''),'MA',paste(Nma,collapse=''))
+    fname <- paste0(paste(per.target,collapse='_'),'_',paste(ypars,collapse='.'),'_',per.par$per.type,noise.tag,'_proxy',paste(Inds,collapse='.'),'_',Nsig.max,'sig_',paste(Pmaxs,collapse='d'),'d')
+    settings <- list(schema_version=1L,data_sets=unname(per.target),observables=vars,
+        periodogram_type=per.par$per.type,signal_type=SigType,noise_model=if(GP) 'GP SHO' else 'ARMA',
+        fixed_GP_period_days=if(GP && SigType!='stochastic' && is.finite(gp.par[2])) exp(gp.par[2]) else NULL,
+        fixed_GP_damping_days=if(GP && is.finite(gp.par[3])) exp(gp.par[3]) else NULL,
+        GP_period_status=if(!GP) 'not applicable' else if(SigType=='stochastic') 'scanned' else if(is.finite(gp.par[2])) 'fixed' else 'free',
+        GP_damping_status=if(!GP) 'not applicable' else if(is.finite(gp.par[3])) 'fixed' else 'free',
+        time_unit='input data time unit (days for JD/BJD inputs)',
+        AR_order_per_set=as.list(setNames(Nars,per.target)),MA_order_per_set=as.list(setNames(Nmas,per.target)),
+        noise_proxies=per.par$Inds,harmonics=if(SigType=='stochastic') NULL else Nh,
+        period_range=1/rev(frange),oversampling=ofac,sequential=Nsig.max>1 && SigType!='stochastic',
+        maximum_signals=Nsig.max,lnBF_threshold=lnBF.min,MCMC_requested=Niter,MCMC_used=if(mcf) Niter else 0,
+        eccentricity_prior=e.prior,scatter_statistic='sample standard deviation (SD, denominator N-1)')
 #    cat('fname=',fname,'\n')
 #    save(list=ls(all=TRUE),file='test1.Robj')
     return(list(per.list=per.list,mc=mc,phase.list=phase.list,sim.list=sim.list,par.list=par.list,tits=tits,pers=pers,levels=sig.levels,ylabs=ylabs,fname=fname,fs=fs,mc.list=mc.list,
-                model.comp=model.list,Nopt=lapply(model.list,model.Nopt)))
+                model.comp=model.list,Nopt=lapply(model.list,model.Nopt),data.status=data.status,settings=settings))
 }
 
 model.Nopt <- function(mc){
@@ -709,6 +796,42 @@ eprior.describe <- function(ep=NULL){
 }
 
 #mcfit <- function(startvalue,Niter,Ncores=1){
+mc.chain.matrix <- function(run,id,settings=list()){
+    x <- run$out
+    fields <- c('iterations','warmup.iterations','initialization.iterations','Ntem','tems','tems.initial',
+                'tem.min','extended','conv','swap.rate','acc.all','null.rate')
+    info <- c(list(chain_id=id,retained_draws=nrow(x)),settings,run[intersect(fields,names(run))])
+    info$within_run_split_Rhat <- if(is.null(run$Rhat)) NULL else as.list(run$Rhat)
+    attr(x,'agatha.chain.info') <- info
+    x
+}
+
+mc.attach.audit <- function(mc,chains,failed=integer()){
+    info <- lapply(chains,function(x) attr(x,'agatha.chain.info'))
+    if(any(vapply(info,is.null,logical(1)))) return(mc)
+    ids <- unlist(lapply(seq_along(chains),function(i)rep(info[[i]]$chain_id,nrow(chains[[i]]))))
+    draws <- unlist(lapply(chains,function(x)seq_len(nrow(x))))
+    stopifnot(nrow(mc)==length(ids))
+    attr(mc,'agatha.chain.rows') <- data.frame(posterior_row=seq_len(nrow(mc)),chain_id=ids,retained_draw=draws)
+    attr(mc,'agatha.chain.info') <- list(schema_version=1L,chains=info,failed_chain_ids=failed,
+        diagnostic_scope='Preserved sampler diagnostics are within-run split Rhat; not independent-chain rank/folded Rhat. ESS is not computed. No convergence claim follows from export alone.')
+    mc
+}
+
+save.mc.audit <- function(samples,prefix){
+    files <- character()
+    for(observable in names(samples)){
+        x <- samples[[observable]];rows <- attr(x,'agatha.chain.rows');info <- attr(x,'agatha.chain.info')
+        if(is.null(rows) || is.null(info)) next
+        stem <- paste0(prefix,'_',gsub('[^[:alnum:]_.-]','_',observable))
+        csv <- paste0(stem,'_MCMCChains.csv');metadata <- paste0(stem,'_MCMCDiagnostics.json')
+        write.csv(rows,csv,row.names=FALSE)
+        jsonlite::write_json(info,metadata,auto_unbox=TRUE,pretty=TRUE,na='null',null='null',digits=NA)
+        files <- c(files,csv,metadata)
+    }
+    files
+}
+
 mcfit <- function(per,data,tsim,Niter=1e3,SigType='kepler',basis='natural',ParSig=NULL,Pconv=FALSE,Ncores=8,
                   mcmc.method='PT',Ntem=NULL,tem.min=NULL,swap.interval=10,mcmc.verbose=FALSE,e.prior=NULL){
 ###get initial parameters from agatha
@@ -769,8 +892,8 @@ mcfit <- function(per,data,tsim,Niter=1e3,SigType='kepler',basis='natural',ParSi
     par.max <- startvalue+1*abs(startvalue)
     inde <- grep('^e\\d',names(par.min))
     indMo <- grep('^omega|^Mo',names(par.min))
-    inda <- grep('^a',names(par.min))
-    indb <- grep('^b',names(par.min))
+    inda <- grep('^a[0-9]+$',names(par.min))
+    indb <- grep('^b[0-9]+$',names(par.min))
     indK <- grep('^K',names(par.min))
     indc <- grep('^c',names(par.min))
     indphi <- grep('^phi|^w',names(par.min))
@@ -810,14 +933,15 @@ mcfit <- function(per,data,tsim,Niter=1e3,SigType='kepler',basis='natural',ParSi
         par.max[indc] <- max(par.max[indc],10*sd(data[,2]))
     }
     if(length(indphi)>0){
-        par.min[indphi] <- min(phi.min,par.min[indphi])
-        par.max[indphi] <- max(phi.max,par.max[indphi])
+        par.min[indphi] <- phi.min
+        par.max[indphi] <- phi.max
     }
     if(length(indbeta)>0){
-        par.min[indbeta] <- min(alpha.min,par.min[indbeta])
-        par.max[indbeta] <- max(alpha.max,par.max[indbeta])
+        par.min[indbeta] <- alpha.min
+        par.max[indbeta] <- alpha.max
     }
     }
+    startvalue <- pmin(pmax(startvalue,par.min),par.max)
     cov.start <- diag(length(startvalue))*1e-6
 ####mcmc
     source('mcmc_func.R',local=TRUE)
@@ -855,7 +979,9 @@ mcfit <- function(per,data,tsim,Niter=1e3,SigType='kepler',basis='natural',ParSi
             startvalue <- par.hot
             tmp <- run.metropolis.MCMC(startvalue,cov.start,iterations=max(as.numeric(Niter),1000),tem=1,bases=rep(basis,10))
         }
-        tmp$out
+        mc.chain.matrix(tmp,ncore,list(method=mcmc.method,requested_iterations=Niter,
+            parameterization='sampling log periods',eccentricity_prior=e.prior,
+            lower=as.list(par.min),upper=as.list(par.max)))
     }
     })
 
@@ -884,7 +1010,7 @@ mcfit <- function(per,data,tsim,Niter=1e3,SigType='kepler',basis='natural',ParSi
         indP <- grep('^per',colnames(mc))
         t0 <- tmin
         if(tmin<24e5) t0 <- t0+24e5
-        Tps <- M02Tp(mc[,indMo],t0,mc[,indP])
+        Tps <- M02Tp(mc[,indMo],t0,exp(mc[,indP]))
         T0 <- t0
         mc1 <- cbind(t0,Tps)
         colnames(mc1) <- c('T0',paste0('Tp',1:length(indP)))
@@ -959,6 +1085,7 @@ mcfit <- function(per,data,tsim,Niter=1e3,SigType='kepler',basis='natural',ParSi
         ysim.all <- RV.kepler(pars.kep=par.opt0,tt=tsim+tmin,bases=bases)+ysim.red
     }
 
+    mc <- mc.attach.audit(mc,mcmc,failed=which(bad))
     list(mc=mc,llmax=llmax,lpmax=lpmax,ParSig=ParSig,out=out,par.stat=par.stat,yma=yma,yar=yar,yred=yred,ysig=ysig,ysig0=as.numeric(ysig0),ysim.red=ysim.red,ysim.sig=ysim.sig,ytrend=ytrend,yproxy=yproxy,res=res,res.sig=res.sig,popt=popt,tsim0=tsim)#ysim.all=ysim.all
 }
 
@@ -967,7 +1094,7 @@ msmc.stat <- function(x,lp=NULL){
 ###does not depend on which data.distr() happens to be visible (functions.R has
 ###a plotting helper of that name that shadows the mcmc_func.R version when the
 ###app sources functions.R locally). xopt is the value in the sample with the
-###highest lp (the MAP estimate when lp is the log posterior or likelihood).
+###highest lp: MAP only for log posterior, maximum likelihood for log likelihood.
     q <- as.numeric(quantile(x,c(0.1587,0.8413,0.5,0.01,0.99,0.1,0.9),na.rm=TRUE))
     mode <- tryCatch({ d <- density(x,na.rm=TRUE); d$x[which.max(d$y)] },error=function(e) q[3])
     xopt <- if(is.null(lp)) NA else as.numeric(x[which.max(lp)])
@@ -1098,8 +1225,11 @@ mcfit.multiset <- function(per, data, set.id, tsim, Niter=1e3, SigType='kepler',
         msg <- tryCatch(conditionMessage(chains[[1]]),error=function(e) 'unknown error')
         stop('all multi-set MCMC chains failed: ',msg)
     }
+    chain.samples <- lapply(which(!bad),function(k)mc.chain.matrix(chains[[k]],k,
+        list(method='PT',requested_iterations=Niter,parameterization='sampling log periods',
+             eccentricity_prior=e.prior,GP_covariance_fixed=gp,lower=as.list(par.min),upper=as.list(par.max))))
     chains <- chains[!bad]
-    mc <- do.call(rbind,lapply(chains,function(ch) ch$out))
+    mc <- do.call(rbind,chain.samples)
     if(mcmc.verbose){
         cat('multi-set PTMCMC: ',length(chains),'chains;',nrow(mc),'samples; max Rhat:',
             max(unlist(lapply(chains,function(ch) if(is.null(ch$Rhat)) NA else max(ch$Rhat))),na.rm=TRUE),'\n')
@@ -1124,6 +1254,7 @@ mcfit.multiset <- function(per, data, set.id, tsim, Niter=1e3, SigType='kepler',
         res <- res-gpm
     }
     ysim0 <- signal.at(pb,tsim)
+    mc <- mc.attach.audit(mc,chain.samples,failed=which(bad))
     list(mc=mc,ParSig=ParSig,par.stat=par.stat,popt=popt,ysig0=as.numeric(ysig0),
          res=as.numeric(res),ysim0=as.numeric(ysim0))
 }
@@ -1504,7 +1635,10 @@ panel.periodogram <- function(per.list,ypar,i,title,levels=NULL,SigType='circula
     if(!is.null(Pmark) && is.finite(Pmark) && Pmark>0){
         k <- which.min(abs(log(P)-log(Pmark)))
     }
-    pmax <- P[k]; wmax <- power[k]
+    # The fitted period may lie between grid points. Only the arrow height
+    # uses the nearest scanned power; the marker reports the actual fit.
+    pmax <- if(!is.null(Pmark) && is.finite(Pmark) && Pmark>0) Pmark else P[k]
+    wmax <- power[k]
     dyv <- max(power)-ymin
     alias <- abs(log(P[kraw]/pmax))>0.01
     par(xpd=TRUE)
@@ -1616,7 +1750,7 @@ panel.fit <- function(phase.list,sim.list,ypar,title,pub=TRUE){
     pub.axes()
     lines(tsim,ysim,col=pub.col$model,lwd=2)
     points.sets(t,y,ey,si)
-    legend.sets(si,extra=paste0('RMS = ',format(sd(y),digits=3)))
+    legend.sets(si,extra=paste0('SD = ',format(sd(y),digits=3)))
 }
 
 panel.residual <- function(phase.list,ypar,title,pub=TRUE){
@@ -1629,19 +1763,19 @@ panel.residual <- function(phase.list,ypar,title,pub=TRUE){
     pub.axes()
     abline(h=0,lty=3,col=pub.col$level)
     points.sets(t,res,ey,si,col1=pub.col$res)
-    legend.sets(si,extra=paste0('RMS = ',format(sd(res),digits=3)))
+    legend.sets(si,extra=paste0('SD = ',format(sd(res),digits=3)))
 }
 
 par.table <- function(pl){
 ###the fitted parameters of one observable as a table. With an MCMC run: the
-###MAP value (sample of maximum likelihood), mean, median and the 16 and 84 per
+###stored fitted point estimate, mean, median and the 16 and 84 per
 ###cent (1 sigma) quantiles; otherwise the maximum-likelihood values alone
     if(is.null(pl) || length(pl)==0) return(NULL)
     if(is.matrix(pl)){
         rn <- rownames(pl)
         get <- function(r) if(r%in%rn) as.numeric(pl[r,]) else rep(NA,ncol(pl))
         map <- if('xopt'%in%rn && any(is.finite(pl['xopt',]))) get('xopt') else get('mode')
-        tab <- data.frame(Parameter=colnames(pl),MAP=map,Mean=get('mean'),Median=get('med'),
+        tab <- data.frame(Parameter=colnames(pl),`Best fit`=map,check.names=FALSE,Mean=get('mean'),Median=get('med'),
                           q16=get('xminus.1sig'),q84=get('xplus.1sig'),stringsAsFactors=FALSE)
         if(!('xopt'%in%rn && any(is.finite(pl['xopt',])))) colnames(tab)[2] <- 'Mode'
     }else{
@@ -1724,7 +1858,7 @@ panel.partable <- function(par.list,ypar,title,pub=TRUE){
     fmt <- function(x) ifelse(is.finite(x),formatC(x,digits=4,format='g'),'')
     cells <- cbind(tab$Parameter,sapply(tab[,-1,drop=FALSE],fmt))
     cells <- matrix(as.character(cells),nrow=nrow(tab))
-    note <- if(ncol(tab)>2) 'MAP: sample of maximum likelihood; q16%, q84%: 16 and 84 per cent quantiles (1 sigma interval)' else NULL
+    note <- if(ncol(tab)>2) 'Best fit: sample of maximum likelihood; q16%, q84%: 16 and 84 per cent quantiles (1 sigma interval)' else NULL
     draw.table(cells,hdr,main,note=note)
     invisible(tab)
 }
@@ -1743,17 +1877,22 @@ panel.modelcomp <- function(model.list,ypar,title,pub=TRUE){
     thr <- attr(mc,'lnBF.min'); if(is.null(thr)) thr <- 5
     nmax <- attr(mc,'Nsig.max')
     nopt <- model.Nopt(mc)
-    cells <- cbind(paste('Signal',mc$n),ifelse(is.finite(mc$P),formatC(mc$P,digits=5,format='g'),''),
+    ps <- if('P_score'%in%names(mc)) mc$P_score else mc$P
+    pf <- if('P_final'%in%names(mc)) mc$P_final else rep(NA_real_,nrow(mc))
+    origin <- ifelse(mc$source=='MCMC','joint MCMC (BIC)',ifelse(mc$source=='Keplerian','Keplerian fit (BIC)','periodogram scan (BIC)'))
+    cells <- cbind(paste('Signal',mc$n),ifelse(is.finite(ps),formatC(ps,digits=5,format='g'),''),
+                   ifelse(is.finite(pf),formatC(pf,digits=5,format='g'),''),
                    ifelse(is.finite(mc$lnBF),formatC(mc$lnBF,digits=3,format='f'),'n/a'),
-                   ifelse(mc$source=='MCMC','joint MCMC (BIC)','periodogram (BIC)'),
+                   origin,
                    ifelse(mc$accepted,'yes','no'))
-    hdr <- c('Model','Period [d]','ln(BF) vs previous','ln(BF) from','Accepted')
+    hdr <- c('Model','Period at score [d]','Final fit [d]','ln(BF) vs previous','ln(BF) from','Accepted')
     note <- c(paste0('Most plausible number of signals: ',nopt,
                      if(!is.null(nmax) && nopt>=nmax) paste0(' (the maximum searched, ',nmax,')') else '',
                      '; a signal is accepted when ln(BF) > ',format(thr,digits=3),
                      if(any(is.na(mc$lnBF))) '; n/a: no Bayes factor for this periodogram type (accepted by default)' else ''),
-              'ln(BF) = difference of maximum log likelihoods minus (extra parameters/2) ln N, i.e. the BIC estimate.')
-    draw.table(cells,hdr,main,note=note,adj=c(0,1,1,0,0))
+              'ln(BF) is a BIC estimate at its stated stage; final parameters do not redefine an earlier score.',
+              'Individual phase panels retain sequential fits; combined/residual panels use the final joint fit when available.')
+    draw.table(cells,hdr,main,note=note,adj=c(0,1,1,1,0,0))
     invisible(mc)
 }
 
@@ -1904,11 +2043,16 @@ reported.period <- function(par.list,ypar,i){
     if(is.null(par.list) || is.null(par.list[[ypar]])) return(NULL)
     pl <- par.list[[ypar]]
     nm <- paste0('P',i)
-    v <- if(is.matrix(pl)) { if(nm%in%colnames(pl)) pl['mode',nm] else NULL } else if(nm%in%names(pl)) pl[[nm]] else NULL
+    v <- if(is.matrix(pl)) {
+        row <- if('xopt'%in%rownames(pl)) 'xopt' else if('mode'%in%rownames(pl)) 'mode' else NULL
+        if(!is.null(row) && nm%in%colnames(pl)) pl[row,nm] else NULL
+    } else if(nm%in%names(pl)) pl[[nm]] else NULL
     if(is.null(v) || !is.finite(v)) NULL else as.numeric(v)
 }
 
 per2D.data <- function(vars,per.par,data,fit1D=NULL){
+    if(length(per.par$per.type)!=1L)
+        stop('Select one periodogram type per 2D run. Calculate and save BFP and MLP separately.',call.=FALSE)
 ###fit1D: a calc.1Dper() result; with per.par$use.fit TRUE the moving
 ###periodogram is computed on its signal-only series (the data minus the
 ###per-set offsets, the trend and the red-noise model of that fit, i.e. the
@@ -1971,7 +2115,7 @@ per2D.data <- function(vars,per.par,data,fit1D=NULL){
         mp <- MP(t=t,y=y,dy=dy,Dt=Dt,nbin=Nbin,ofac=ofac,fmin=frange[1],fmax=frange[2],per.type=per.type,sj=0,Nma=0,Nar=0,Indices=NULL,adaptive=adaptive)
         fname <- paste0(paste(per.target,collapse='_'),'_MP_',paste(per.type,collapse=''),'_signalonly',if(adaptive) '_adaptive' else '')
         out <- list(t=t,y=y,dy=dy,xx=mp$tmid,yy=mp$P,zz=mp$powers,zz.rel=mp$rel.powers,fname=fname,ypar=var,
-                    set=per.target[match(sets[set0],per.target)],signal.only=TRUE,tstart=mp$tstart,tend=mp$tend,adaptive=adaptive)
+                    set=per.target[match(sets[set0],per.target)],signal.only=TRUE,tstart=mp$tstart,tend=mp$tend,ndata=mp$ndata,adaptive=adaptive)
         if(length(per.target)>1){
             out$subdata <- lapply(1:length(per.target),function(j) data[[per.target[j]]])
             out$idata <- lapply(per.target,function(s){ k <- set0==match(s,sets); cbind(t[k],y[k],dy[k]) })
@@ -2005,19 +2149,14 @@ per2D.data <- function(vars,per.par,data,fit1D=NULL){
             Indices <- as.matrix(tab[,4:ncol(tab),drop=FALSE])
         }
     }
-    if(length(Inds)>0){
-        if(all(Inds==0)){
-            Indices <- NULL
-        }else{
-            Inds <- Inds[Inds>0]
-            Indices <- as.matrix(Indices[,Inds,drop=FALSE])
-            for(j in 1:ncol(Indices)){
-                Indices[,j] <- scale(Indices[,j])
-            }
-        }
-    }else{
-        Indices <- NULL
+    if(length(per.target)==1 && var!=colnames(tab)[2] && var!='Window Function'){
+        if(!var%in%colnames(tab)) stop('Unknown activity observable: ',var,call.=FALSE)
+        ok <- is.finite(tab[,1]) & is.finite(tab[,var])
+        if(sum(ok)<6 || !is.finite(sd(tab[ok,var])) || sd(tab[ok,var])==0)
+            stop('Activity observable ',var,' needs at least six finite, varying measurements.',call.=FALSE)
+        tab <- tab[ok,,drop=FALSE]
     }
+    Indices <- agatha.select.indices(tab,Inds)
     ypar <- var
     t <- tab[,1]
     y <- tab[,ypar]
@@ -2035,9 +2174,9 @@ per2D.data <- function(vars,per.par,data,fit1D=NULL){
     z2.rel <- mp$rel.powers
     fname <- paste0(paste(per.target,collapse='_'),'_MP_',paste(per.type,collapse=''),if(GP) '_GP' else paste0('_MA',paste(Nmas,collapse='')),'proxy',paste(Inds,collapse='.'),if(adaptive) '_adaptive' else '')
     if(length(per.target)==1){
-        return(list(t=t,y=y,dy=dy,xx=x2,yy=y2,zz=z2,zz.rel=z2.rel,fname=fname,ypar=ypar,tstart=mp$tstart,tend=mp$tend,adaptive=adaptive))
+        return(list(t=t,y=y,dy=dy,xx=x2,yy=y2,zz=z2,zz.rel=z2.rel,fname=fname,ypar=ypar,tstart=mp$tstart,tend=mp$tend,ndata=mp$ndata,adaptive=adaptive))
     }else{
-        return(list(t=t,y=y,dy=dy,xx=x2,yy=y2,zz=z2,zz.rel=z2.rel,subdata=subdata,idata=idata,fname=fname,ypar=ypar,tstart=mp$tstart,tend=mp$tend,adaptive=adaptive))
+        return(list(t=t,y=y,dy=dy,xx=x2,yy=y2,zz=z2,zz.rel=z2.rel,subdata=subdata,idata=idata,fname=fname,ypar=ypar,tstart=mp$tstart,tend=mp$tend,ndata=mp$ndata,adaptive=adaptive))
     }
 }
 
@@ -2067,6 +2206,18 @@ calcBF <- function(data,Nbasic,proxy.type,Nma.max,Nar.max,groups=NULL,Nproxy=NUL
     t <- data[,1]
     y <- data[,2]
     dy <- data[,3]
+    status <- agatha.proxy.status(data)
+    if(proxy.type!='man' && any(!status$regression.usable))
+        stop('Automatic proxy comparison requires complete, varying indices. Use manual groups of available proxy numbers; no RV rows were removed.',call.=FALSE)
+    if(proxy.type=='man'){
+        groups <- lapply(groups,function(group){
+            inds <- unlist(group)
+            agatha.select.indices(data,inds)
+            inds <- sort(unique(as.integer(inds)))
+            inds <- inds[inds>0L]
+            if(length(inds)) inds else 0L
+        })
+    }
     NI.max <- ncol(data)-3
     NI.inds <- list(0)
     if(NI.max>0){
@@ -2303,7 +2454,8 @@ diagnose.signals <- function(data,sets,noise.models=c('W','MA','AR'),Nsig.max=3,
              noise.model=if(model=='GP') 'GP' else 'ARMA',gp.Prot=gp.Prot,gp.tau=gp.tau)
     }
     out <- list(sets=sets,rv=rv,noise.models=noise.models,lnBF.min=lnBF.min,Nsig.max=Nsig.max,tspan=tspan,frange=frange,
-                combined=list(),individual=list(),proxies=list(),moving=NULL)
+                combined=list(),individual=list(),proxies=list(),proxy.status=list(),moving=NULL,
+                checks=list(individual=individual,proxies=proxies,moving=moving))
     for(m in noise.models){
         step(paste0('combined data, ',m,' noise'))
         pp <- base(sets,m,sequence=Nsig.max>1,Nsig=Nsig.max)
@@ -2319,12 +2471,32 @@ diagnose.signals <- function(data,sets,noise.models=c('W','MA','AR'),Nsig.max=3,
     }
     if(proxies){
         for(s in sets){
-            idx <- colnames(data[[s]])[-(1:3)]
-            if(length(idx)==0) next
-            step(paste0('activity indices of ',s))
-            pp <- base(s,'W',sequence=FALSE,Nsig=1)
-            pp$ns <- c(rv,idx,'Window Function')
-            out$proxies[[s]] <- calc.1Dper(Nmax.plots=50,vars=idx,per.par=pp,data=data,Ncores=Ncores)
+            status <- agatha.proxy.status(data[[s]])
+            status$analysis.completed <- rep(FALSE,nrow(status))
+            status$analysis.error <- rep('',nrow(status))
+            idx <- status$name[status$periodogram.usable]
+            if(length(idx)>0){
+                step(paste0('activity indices of ',s))
+                pp <- base(s,'W',sequence=FALSE,Nsig=1)
+                pp$ns <- c(rv,idx,'Window Function')
+                # Separate calls allow genuinely different finite subsets.
+                results <- list(); merged <- list()
+                for(index in idx){
+                    one <- tryCatch(calc.1Dper(Nmax.plots=50,vars=index,per.par=pp,data=data,Ncores=Ncores),
+                        error=function(e){status$analysis.error[status$name==index] <<- conditionMessage(e); NULL})
+                    per <- if(is.null(one)) NULL else one$per.list[[index]]
+                    valid <- is.matrix(per) && nrow(per)>=2 && ncol(per)>=2 &&
+                             all(is.finite(per[,1])) && any(is.finite(per[,2]))
+                    if(valid){
+                        results[[index]] <- one; merged[[index]] <- one$per.list[[index]]
+                        status$analysis.completed[status$name==index] <- TRUE
+                    }else if(!nzchar(status$analysis.error[status$name==index])){
+                        status$analysis.error[status$name==index] <- 'no finite activity periodogram returned'
+                    }
+                }
+                if(length(merged)>0) out$proxies[[s]] <- list(per.list=merged,index.results=results)
+            }
+            out$proxy.status[[s]] <- status
         }
     }
     mc <- out$combined[[m1]]$model.comp[[rv]]
@@ -2357,11 +2529,70 @@ diagnose.signals <- function(data,sets,noise.models=c('W','MA','AR'),Nsig.max=3,
     out
 }
 
+diagnosis.moving.par <- function(diag,k,pmin=NULL,pmax=NULL){
+###Display-only bounds shared by the GUI and PDF; the full scan is unchanged.
+    full <- sort(1/diag$frange)
+    scalar <- function(x) length(x)==1L && is.finite(x)
+    has.min <- scalar(pmin); has.max <- scalar(pmax)
+    if(xor(has.min,has.max)) stop('Enter both right-panel period bounds, or leave both blank.',call.=FALSE)
+    if(has.min && (pmin<=0 || pmin>=pmax || pmax<full[1] || pmin>full[2]))
+        stop('Right-panel period bounds must be positive, increasing, and overlap the scanned range.',call.=FALSE)
+    bounds <- if(has.min) c(pmin,pmax) else c(0.8,1.2)*diag$periods[k]
+    pp <- diag$moving.par
+    pp$pmin.zoom <- max(full[1],bounds[1]); pp$pmax.zoom <- min(full[2],bounds[2])
+    pp
+}
+
 diag.peak <- function(per,P0,tol=0.1){
 ###the highest power of a periodogram matrix (P, power) within tol*P0 of P0
     k <- which(abs(per[,1]-P0)<tol*P0)
     if(length(k)==0) return(NA)
     max(per[k,2],na.rm=TRUE)
+}
+
+diag.matches <- function(periods,mc,tol=0.1){
+###Maximum-cardinality one-to-one matching; nearest relative period is tried
+###first. One comparison-model signal cannot validate two baseline candidates.
+    out <- rep(NA_integer_,length(periods))
+    if(is.null(mc) || nrow(mc)==0) return(out)
+    acc <- which(cumprod(as.logical(mc$accepted))==1)
+    if(length(acc)==0) return(out)
+    neighbours <- lapply(periods,function(p){
+        j <- acc[is.finite(mc$P[acc]) & abs(mc$P[acc]-p)<tol*p]
+        j[order(abs(mc$P[j]-p)/p)]
+    })
+    owner <- rep(NA_integer_,nrow(mc))
+    visit <- function(k){
+        for(j in neighbours[[k]]){
+            if(seen[j]) next
+            seen[j] <<- TRUE
+            if(is.na(owner[j]) || visit(owner[j])){
+                owner[j] <<- k
+                return(TRUE)
+            }
+        }
+        FALSE
+    }
+    for(k in order(lengths(neighbours),seq_along(periods))){
+        seen <- rep(FALSE,nrow(mc))
+        visit(k)
+    }
+    used <- which(!is.na(owner));out[owner[used]] <- used
+    out
+}
+
+diag.local.peak <- function(result,rv,P0,tol=0.1){
+###Inspect the last available search scan only. This is descriptive, not a
+###newly fitted/accepted signal, and may precede subtraction of the last fit.
+    per <- result$per.list[[rv]]
+    empty <- list(P=NA_real_,lnBF=NA_real_,scan='unavailable')
+    if(is.null(per) || !is.matrix(per) || ncol(per)<2) return(empty)
+    j <- ncol(per)
+    k <- which(is.finite(per[,1]) & is.finite(per[,j]) & abs(per[,1]-P0)<tol*P0)
+    if(!length(k)) return(empty)
+    k <- k[which.max(per[k,j])]
+    label <- if(is.null(colnames(per))) paste0('column ',j) else colnames(per)[j]
+    list(P=per[k,1],lnBF=per[k,j],scan=label)
 }
 
 diagnosis.table <- function(diag,tol=0.1){
@@ -2372,24 +2603,48 @@ diagnosis.table <- function(diag,tol=0.1){
     if(length(P)==0) return(NULL)
     thr <- diag$lnBF.min; rv <- diag$rv
     rows <- list()
+    matches <- lapply(diag$noise.models,function(m) diag.matches(P,diag$combined[[m]]$model.comp[[rv]],tol))
+    names(matches) <- diag$noise.models
+    noise.checked <- length(diag$noise.models)>1
+    proxy.checked <- length(diag$proxies)>0 && any(vapply(diag$proxies,function(x)
+        any(names(x$per.list)!='Window Function'),logical(1)))
+    coverage <- unlist(lapply(names(diag$proxy.status),function(s){
+        status <- diag$proxy.status[[s]]
+        if(nrow(status)==0) return(character())
+        paste0(set.label(s),': ',status$name,' ',status$n.finite,'/',status$n.total,
+               ifelse(status$analysis.completed,' checked',paste0(' unavailable (',status$status,
+                   ifelse(nzchar(status$analysis.error),paste0('; ',status$analysis.error),''),')')))
+    }))
+    proxy.incomplete <- any(vapply(diag$proxy.status,function(x) any(!x$analysis.completed),logical(1)))
     for(k in seq_along(P)){
         row <- list(Signal=k,`Period [d]`=signif(P[k],5))
 ###ln(BF) of the signal under each noise model (from the sequential search)
         robust <- TRUE
+        unmatched <- FALSE
         for(m in diag$noise.models){
             mc <- diag$combined[[m]]$model.comp[[rv]]
             if(m==diag$noise.models[1]){
                 j <- k
             }else{
 ###the accepted signal of this noise model closest to the period, within tol
-                acc <- if(is.null(mc)) integer(0) else which(cumprod(as.logical(mc$accepted))==1 & abs(mc$P-P[k])<tol*P[k])
-                j <- if(length(acc)>0) acc[which.min(abs(mc$P[acc]-P[k]))] else integer(0)
+                j <- matches[[m]][k]
+                if(is.na(j)) j <- integer(0)
             }
             v <- if(length(j)>0 && j<=nrow(mc)) mc$lnBF[j] else NA
             row[[paste0('ln(BF) ',m)]] <- if(is.finite(v)) round(v,1) else NA
-            if(!(length(j)>0 && (is.na(v) || v>thr))) robust <- FALSE
+            if(m!=diag$noise.models[1]){
+                matched <- length(j)>0 && j<=nrow(mc)
+                row[[paste0('Accepted candidate match ',m)]] <- if(matched) paste0('signal ',j) else 'not matched in accepted list'
+                unmatched <- unmatched || !matched
+                peak <- if(!matched) diag.local.peak(diag$combined[[m]],rv,P[k],tol) else
+                    list(P=NA_real_,lnBF=NA_real_,scan='not checked (accepted candidate matched)')
+                row[[paste0('Local scan peak P [d] ',m)]] <- signif(peak$P,7)
+                row[[paste0('Local scan peak ln(BF) ',m)]] <- round(peak$lnBF,3)
+                row[[paste0('Local scan ',m)]] <- peak$scan
+            }
+            if(!(length(j)>0 && is.finite(v) && v>thr)) robust <- FALSE
         }
-        row$`Robust to noise model` <- if(robust) 'yes' else 'no'
+        row$`Robust to noise model` <- if(!noise.checked) 'not checked' else if(unmatched) 'inconclusive (unmatched candidate)' else if(robust) 'yes' else 'no'
 ###a period within tol of an earlier accepted signal is likely its alias or residual
         near <- which(seq_along(P)<k & abs(P-P[k])<tol*P[k])
 ###activity indices whose periodogram peaks within tol of the period
@@ -2402,11 +2657,14 @@ diagnosis.table <- function(diag,tol=0.1){
                 if(is.finite(v) && v>thr) act <- c(act,paste0(set.label(s),': ',idx))
             }
         }
-        row$`Activity overlap` <- if(length(act)>0) paste(act,collapse='; ') else 'none'
+        row$`Activity overlap` <- if(length(act)>0) paste(act,collapse='; ') else if(proxy.checked)
+            if(proxy.incomplete) 'none among checked indices; unavailable indices' else 'none' else
+            if(identical(diag$checks$proxies,FALSE)) 'not checked' else if(length(coverage)>0) 'no usable activity data' else 'no activity data'
+        if(length(coverage)>0) row$`Activity data coverage` <- paste(coverage,collapse='; ')
 ###window function: is the sampling pattern's strongest peak at this period?
         wf <- diag$combined[[1]]$per.list[['Window Function']]
         wfp <- if(is.null(wf)) NA else wf[which.max(wf[,2]),1]
-        row$`Window function peak` <- if(is.finite(wfp) && abs(wfp-P[k])<tol*P[k]) 'yes' else 'no'
+        row$`Window function peak` <- if(!is.finite(wfp)) 'not checked' else if(abs(wfp-P[k])<tol*P[k]) 'yes' else 'no'
 ###time consistency: windows of the moving periodogram in which the signal exceeds the threshold
         tc <- NA
         mv <- if(is.list(diag$moving) && length(diag$moving)>=k) diag$moving[[k]] else NULL
@@ -2418,14 +2676,18 @@ diagnosis.table <- function(diag,tol=0.1){
             if(nrow(zz)==length(mv$yy) && any(sel)){
                 pk <- apply(zz[sel,,drop=FALSE],2,function(z) suppressWarnings(max(z,na.rm=TRUE)))
                 ok <- is.finite(pk)
-                tc <- paste0(sum(pk[ok]>thr),'/',sum(ok),' windows')
+                if(sum(ok)>0) tc <- paste0(sum(pk[ok]>thr),'/',sum(ok),' windows')
                 row$tc.frac <- if(sum(ok)>0) sum(pk[ok]>thr)/sum(ok) else NA
             }
         }
-        row$`Consistent over time` <- if(is.na(tc)) 'n/a' else tc
+        row$`Consistent over time` <- if(is.na(tc)) {
+            if(identical(diag$checks$moving,FALSE)) 'not checked' else 'unavailable'
+        } else tc
 ###verdict
-        v1 <- is.finite(row[[paste0('ln(BF) ',diag$noise.models[1])]]) && row[[paste0('ln(BF) ',diag$noise.models[1])]]>thr
-        verdict <- if(!v1) 'not significant' else if(!robust) 'depends on the noise model' else if(length(act)>0) 'possible activity' else 'candidate'
+        raw <- diag$combined[[1]]$model.comp[[rv]]$lnBF[k]
+        v1 <- is.finite(raw) && raw>thr
+        verdict <- if(!v1) 'not significant' else if(noise.checked && unmatched) 'noise-model check inconclusive (unmatched candidate)' else if(noise.checked && !robust) 'depends on the noise model' else if(length(act)>0) 'possible activity' else 'candidate'
+        if(!noise.checked || unmatched || !proxy.checked || proxy.incomplete || is.na(tc)) verdict <- paste0(verdict,'; incomplete checks')
         if(row$`Window function peak`=='yes') verdict <- paste0(verdict,'; at a window-function peak')
         if(length(near)>0) verdict <- paste0(verdict,'; within ',round(100*tol),'% of signal ',near[1],' (alias or residual?)')
         if(!is.null(row$tc.frac) && is.finite(row$tc.frac) && row$tc.frac<0.5 && P[k]<diag$tspan/2) verdict <- paste0(verdict,'; not consistent over time')
@@ -2541,4 +2803,31 @@ diagnosis.plot <- function(diag,ncol=3,Prot=NA,pub=TRUE){
         if(k%%ncol!=0) .fig.grid$k <- k+(ncol-k%%ncol)
     }
     invisible(n)
+}
+
+kepler.evec <- function(pars,inverse=FALSE){
+    vector.input <- is.null(dim(pars))
+    if(vector.input) pars <- matrix(pars,nrow=1,dimnames=list(NULL,names(pars)))
+    ans <- pars
+    ids <- sub('^per','',grep('^per[0-9]+$',colnames(pars),value=TRUE))
+    for(id in ids){
+        natural <- paste0(c('e','omega','Mo'),id)
+        smooth <- paste0(c('sqrecosw','sqresinw','lambda'),id)
+        source.names <- if(inverse) smooth else natural
+        if(!all(source.names%in%colnames(pars))) stop('incomplete Keplerian parameter names')
+        ix <- match(source.names,colnames(pars))
+        if(inverse){
+            h <- pars[,ix[1]]; k <- pars[,ix[2]]
+            e <- h*h+k*k; w <- atan2(k,h)%%(2*pi)
+            ans[,ix] <- cbind(e,w,(pars[,ix[3]]-w)%%(2*pi))
+            colnames(ans)[ix] <- natural
+        }else{
+            e <- pars[,ix[1]]; w <- pars[,ix[2]]
+            if(any(!is.finite(e) | e<0)) stop('eccentricity must be finite and nonnegative')
+            ans[,ix] <- cbind(sqrt(e)*cos(w),sqrt(e)*sin(w),(pars[,ix[3]]+w)%%(2*pi))
+            colnames(ans)[ix] <- smooth
+        }
+    }
+    if(vector.input) return(setNames(as.numeric(ans),colnames(ans)))
+    ans
 }

@@ -107,25 +107,31 @@ for(j in 1:2){
         fup <- 1.2
         for(k in ind.show){
 #            inds <- which(yy>12 & yy<30)
-            if(exists('pmin.zoom')){
+            explicit.zoom <- exists('pmin.zoom') && exists('pmax.zoom')
+            if(explicit.zoom){
                 pmin <- pmin.zoom
                 pmax <- pmax.zoom
             }else{
                 pmin <- max(min(yy),flow*sigs[k])
                 pmax <- min(fup*sigs[k],max(yy))
             }
-            inds <- which(yy>pmin & yy<pmax)
-            if(length(inds)<5){
+            inds <- which(yy>=pmin & yy<=pmax)
+            if(explicit.zoom && length(inds)<2){
+                plot.new()
+                text(0.5,0.5,'Too few period-grid points in the zoom range.\nChoose a wider range or increase oversampling.',cex=0.7)
+                next
+            }
+            if(!explicit.zoom && length(inds)<5){
                 pmin <- max(min(yy),flow*sigs[k])
                 pmax <- min(2*fup*sigs[k],max(yy))
                 inds <- which(yy> pmin& yy<pmax)
             }
-            if(length(inds)<5){
+            if(!explicit.zoom && length(inds)<5){
                 pmin <- min(yy)
                 pmax <- 3*min(yy)
                 inds <- which(yy>pmin & yy<pmax)
             }
-            image(xx,log10(yy[inds]),t(zz[inds,]),xlab='',ylab='Orbital period [day]',axes=FALSE,col=cols,xlim=xlim,zlim=zlim)
+            image(xx,log10(yy[inds]),t(zz[inds,,drop=FALSE]),xlab='',ylab='Period [day]',axes=FALSE,col=cols,xlim=xlim,zlim=zlim)
             if(FALSE){
                 labs <- at.labels
                 labs[2*(1:floor(length(at.labels)/2))] <- ''

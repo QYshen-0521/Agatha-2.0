@@ -6,7 +6,7 @@
 ####Petit, Laskar & Boue 2018) and Hill criteria; a numerical integration with
 ####REBOUND's WHFast (scripts/nbody_rebound.py) over e.g. 10 Myr; a short-term
 ####leapfrog in R when Python/REBOUND are not available. Either the nominal
-####(MAP) solution or a Monte Carlo sample of the posterior is integrated.
+####highest-likelihood sample/fit or a Monte Carlo sample is integrated.
 
 nbody.G <- 4*pi^2                     #AU^3 Msun^-1 yr^-2
 Mjup.Msun <- 9.5458e-4
@@ -81,14 +81,18 @@ amd.stability <- function(orb,Mstar=1){
         m1 <- o$m[k]; m2 <- o$m[k+1]; a1 <- o$a[k]; a2 <- o$a[k+1]
         alpha <- a1/a2; gam <- m1/m2; eps <- (m1+m2)/Mstar
         C <- AMD/Lam[k+1]
-###collision: the least relative AMD on the collision curve alpha e1 + e2 = 1
-        f <- function(e1){ e2 <- 1-alpha*e1; gam*sqrt(alpha)*(1-sqrt(1-e1^2))+(1-sqrt(1-e2^2)) }
-        Cc.coll <- optimize(f,c(0,min(1,1/alpha)-1e-9))$objective
+###Contact: a1(1+e1)=a2(1-e2), hence alpha e1+e2=1-alpha.
+        deficit <- function(e) e^2/(1+sqrt(pmax(0,1-e^2)))
+        f <- function(e1){e2<-max(0,1-alpha-alpha*e1);gam*sqrt(alpha)*deficit(e1)+deficit(e2)}
+        emax <- min(1,(1-alpha)/alpha)
+        Cc.coll <- if(emax<=0) 0 else min(f(0),f(emax),optimize(f,c(0,emax),tol=1e-12)$objective)
         Cc.hill <- gam*sqrt(alpha)+1-(1+gam)^1.5*sqrt(alpha/(gam+alpha)*(1+3^(4/3)*eps^(2/3)*gam/(1+gam)^2))
         Cc <- min(Cc.coll,Cc.hill,na.rm=TRUE)
         rh <- ((m1+m2)/(3*Mstar))^(1/3)*(a1+a2)/2
         rows[[k]] <- data.frame(pair=paste0(o$signal[k],'-',o$signal[k+1]),a.inner=a1,a.outer=a2,relative.AMD=C,
-                                critical.collision=Cc.coll,critical.Hill=Cc.hill,AMD.ratio=C/Cc,
+                                critical.collision=Cc.coll,critical.Hill=Cc.hill,
+                                AMD.ratio=if(is.finite(Cc) && Cc>0) C/Cc else NA_real_,
+                                AMD.ratio.status=if(is.finite(Cc) && Cc>0) 'defined' else 'undefined (non-positive or non-finite critical AMD)',
                                 Hill.separation=(a2-a1)/rh,AMD.stable=C<Cc,Hill.stable=(a2-a1)/rh>2*sqrt(3),
                                 stringsAsFactors=FALSE)
     }
@@ -96,7 +100,7 @@ amd.stability <- function(orb,Mstar=1){
 }
 
 nbody.samples <- function(res1D,ypar='RV',N=0,seed=NULL){
-###the nominal RV solution (MAP, or the mode/maximum likelihood) and N Monte
+###the nominal RV solution (highest-likelihood sample, or mode/fit) and N Monte
 ###Carlo draws of the signal parameters: rows of the MCMC sample when it holds
 ###every signal, else Gaussian draws from the 1-sigma quantiles of the
 ###parameter table, else none
@@ -110,9 +114,28 @@ nbody.samples <- function(res1D,ypar='RV',N=0,seed=NULL){
     }
     sig <- rv.signals(nominal)
     if(is.null(sig)) stop('no Keplerian or circular signal among the fitted parameters')
+###Only the contiguous accepted search sequence is eligible for dynamics.
+###Manual parameter inputs without search metadata remain supported.
+    comp <- res1D$model.comp[[ypar]]
+    accepted <- NULL
+    if(!is.null(comp) && 'accepted'%in%names(comp)){
+        keep <- which(cumprod(as.logical(comp$accepted))==1)
+        accepted <- if('n'%in%names(comp)) comp$n[keep] else keep
+    }else if(!is.null(res1D$Nopt[[ypar]])){
+        accepted <- seq_len(as.integer(res1D$Nopt[[ypar]]))
+    }
+    if(!is.null(accepted)){
+        rejected <- setdiff(sig$signal,accepted)
+        if(length(rejected)>0){
+            drop <- grepl(paste0('^(P|K|e|omega|Mo|A|B)(',paste(rejected,collapse='|'),')$'),names(nominal))
+            nominal <- nominal[!drop]
+        }
+        sig <- rv.signals(nominal)
+        if(is.null(sig)) stop('no accepted signal available for N-body integration')
+    }
     need <- unlist(lapply(sig$signal,function(k) paste0(c('P','K','e','omega','Mo','A','B'),k)))
     need <- need[need%in%names(nominal)]
-    out <- list(nominal=nominal,samples=list(),method='nominal solution only')
+    out <- list(nominal=nominal,samples=list(),method='nominal solution only',acceptance.checked=!is.null(accepted))
     if(N>0){
         if(!is.null(seed)) set.seed(seed)
         mc <- res1D$mc.list[[ypar]]
@@ -289,18 +312,26 @@ nbody.run <- function(orbit.list,Mstar=1,tmax=1e7,steps.per.orbit=20,Nout=200,es
 nbody.classify <- function(run,orbit.list,a.tol=0.2,e.max=0.9){
 ###one row per integrated system: the integrator's verdict, refined by the
 ###drift of the semi-major axes (|a/a0 - 1| > a.tol) and the eccentricities
-###(e > e.max) along the tracks; unstable systems report the time of the event
+###(e > e.max) along the tracks. Keep backend termination distinct from the
+###first saved drift exceedance; neither is a continuous-time lifetime.
     s <- run$summary
     out <- list()
     for(i in seq_len(nrow(s))){
         tr <- run$tracks[run$tracks$system==s$system[i],]
         a0 <- orbit.list[[s$system[i]]]$a
         da <- abs(tr$a/a0[tr$planet]-1)
-        bad <- which(da>a.tol | tr$e>e.max)
+        bad <- which(da>a.tol)
+        high.e <- any(tr$e>e.max,na.rm=TRUE)
         status <- s$status[i]; t.end <- s$t_end[i]
+        drift.time <- if(length(bad)) min(tr$t[bad]) else NA_real_
+        event.time <- if(status!='stable') t.end else NA_real_
+        times <- c(event.time,drift.time);times <- times[is.finite(times)]
+        failure.time <- if(length(times)) min(times) else NA_real_
         if(status=='stable' && length(bad)>0){ status <- 'unstable (drift)'; t.end <- min(tr$t[bad]) }
         out[[i]] <- data.frame(system=s$system[i],status=status,t.end=t.end,max.da=max(da,na.rm=TRUE),max.e=max(tr$e,na.rm=TRUE),
-                               dE=s$dE[i],stable=status=='stable',stringsAsFactors=FALSE)
+                               dE=s$dE[i],stable=status=='stable',eccentricity.limit.exceeded=high.e,
+                               backend.status=s$status[i],backend.t.end=s$t_end[i],
+                               first.saved.drift.time=drift.time,screening.failure.time=failure.time,stringsAsFactors=FALSE)
     }
     do.call(rbind,out)
 }
@@ -312,7 +343,14 @@ nbody.plot <- function(run,orbit.list,system=1,main='Nominal solution'){
     n <- nrow(orb)
     cols <- set.palette[(1:n-1)%%length(set.palette)+1]
     op <- par(mfrow=c(2,1),mar=c(4.2,5,2.5,1.2),mgp=c(2.8,0.7,0),las=1); on.exit(par(op))
-    tt <- pmax(tr$t,min(tr$t[tr$t>0]))
+    positive <- tr$t[is.finite(tr$t) & tr$t>0]
+    if(length(positive)==0){
+        plot.new(); title(main=main)
+        text(.5,.5,'Integration stopped before the first positive-time output.\nSee status and event time; no trajectory is available.')
+        plot.new()
+        return(invisible())
+    }
+    tt <- pmax(tr$t,min(positive))
     plot(tt,tr$a,type='n',log='xy',xlab='Time [yr]',ylab='a [AU]',main=main)
     for(k in 1:n){ s <- tr$planet==k; lines(tt[s],tr$a[s],col=cols[k],lwd=1.5) }
     legend('topleft',bg='white',box.col='white',legend=paste0('signal ',orb$signal,' (P = ',signif(orb$P,4),' d)'),col=cols,lwd=1.5,cex=0.85)
@@ -324,13 +362,14 @@ nbody.plot <- function(run,orbit.list,system=1,main='Nominal solution'){
 nbody.mc.plot <- function(cls,tmax,main='Monte Carlo sample'){
 ###the fraction of the sampled systems still stable as a function of time
     if(is.null(cls) || nrow(cls)==0) return(invisible())
-    te <- ifelse(cls$stable,Inf,cls$t.end)
+    failure <- if('screening.failure.time'%in%names(cls)) cls$screening.failure.time else cls$t.end
+    te <- ifelse(cls$stable,Inf,failure)
     tt <- sort(unique(c(te[is.finite(te)],tmax)))
     frac <- sapply(tt,function(x) mean(te>x))
     t0 <- min(c(tt[tt>0],tmax))/10
     op <- par(mar=c(4.2,5,2.5,1.2),mgp=c(2.8,0.7,0),las=1); on.exit(par(op))
-    plot(c(t0,tt),c(1,frac),type='s',log='x',xlab='Time [yr]',ylab='Fraction of stable systems',ylim=c(0,1.05),main=main,lwd=2,col=pub.col$peak)
-    text(t0,0.05,paste0(sum(cls$stable),' of ',nrow(cls),' systems stable to ',format(tmax,big.mark=','),' yr'),adj=c(0,0),col=pub.col$peak)
+    plot(c(t0,tt),c(1,frac),type='s',log='x',xlab='Time [yr]',ylab='Fraction passing screening',ylim=c(0,1.05),main=main,lwd=2,col=pub.col$peak)
+    text(t0,0.05,paste0(sum(cls$stable),' of ',nrow(cls),' systems pass screening through ',format(tmax,big.mark=','),' yr'),adj=c(0,0),col=pub.col$peak)
     invisible()
 }
 
@@ -344,7 +383,10 @@ nbody.launch <- function(orbit.list,settings,wd=getwd()){
     saveRDS(list(orbit.list=orbit.list,settings=settings,wd=normalizePath(wd)),file.path(dir,'config.rds'))
 ###the whole group is backgrounded with its own redirections, so that the
 ###process id can be read without waiting for the job
-    cmd <- sprintf('{ cd %s && %s %s %s %s ; } > %s 2>&1 < /dev/null & echo $!',shQuote(normalizePath(wd)),shQuote(file.path(R.home('bin'),'Rscript')),
+    rscript <- Sys.which('Rscript')
+    if(!nzchar(rscript)) rscript <- file.path(R.home('bin'),'Rscript')
+    if(!file.exists(rscript)) stop('Rscript was not found; add the working Rscript to PATH')
+    cmd <- sprintf('{ cd %s && %s %s %s %s ; } > %s 2>&1 < /dev/null & echo $!',shQuote(normalizePath(wd)),shQuote(rscript),
                    shQuote('scripts/nbody_run.R'),shQuote(file.path(dir,'config.rds')),shQuote(dir),shQuote(file.path(dir,'log.txt')))
     pid <- suppressWarnings(as.integer(system(cmd,intern=TRUE)[1]))
     list(dir=dir,pid=pid,started=Sys.time(),n=length(orbit.list))

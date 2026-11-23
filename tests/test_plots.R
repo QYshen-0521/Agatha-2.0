@@ -70,7 +70,7 @@ expect_true(is.data.frame(tb) && 'P1'%in%tb$Parameter && ncol(tb)==2,'par.table 
 stat <- rbind(xopt=1:3,xminus.1sig=0:2,xplus.1sig=2:4,mode=1:3,med=1:3,mean=1:3)
 colnames(stat) <- c('P1','K1','e1')
 tb <- par.table(stat)
-expect_true(all(c('Parameter','MAP','Mean','Median','q16','q84')==colnames(tb)) && tb$q84[3]==4,
+expect_true(all(c('Parameter','Best fit','Mean','Median','q16','q84')==colnames(tb)) && tb$q84[3]==4,
             'par.table of an MCMC summary is wrong')
 pdf(NULL)
 tb2 <- panel.partable(list(RV=stat),'RV',out$tits[1])

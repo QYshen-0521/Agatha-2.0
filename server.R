@@ -104,26 +104,24 @@ The BFP and MLP can be compared with the Lomb-Scargle periodogram (LS), the gene
     })
 
     output$per.type.seq <- renderUI({
-        if(is.null(input$sequence)) return()
-        if(input$sequence) selectInput("per.type.seq",'Periodogram used to find additional signals',choices=input$per.type,selected=NULL,multiple=FALSE)
+        if(!isTRUE(input$sequence) || !isTRUE(input$signal.type%in%c('circular','kepler'))) return()
+        selectInput("per.type.seq",'Periodogram used to find additional signals',choices=input$per.type,selected=input$per.type[1],multiple=FALSE)
     })
 
     output$sequential <- renderUI({
-        if(is.null(Ntarget()) | is.null(input$signal.type)) return()
-        if(input$signal.type!='stochastic'){
+        conditionalPanel("['circular', 'kepler'].indexOf(input['signal.type']) >= 0",
             checkboxInput('sequence','Find additional signals sequentially',value=FALSE)
-        }
+        )
     })
 
     output$Nsig.max <- renderUI({
-        if(is.null(input$sequence)) return()
-        if(input$sequence){
+        conditionalPanel("input.sequence && ['circular', 'kepler'].indexOf(input['signal.type']) >= 0",
             tagList(
                 sliderInput("Nsig.max", "Maximum number of signals", min = 2, max = 10,value=2,step=1),
                 numericInput('lnBF.min','ln(BF) a further signal must exceed to be accepted',value=5,min=0,max=100,step=0.5),
                 helpText('Signals are added one at a time and compared with the model without them (BIC-estimated ln(BF); from the joint MCMC of all signals for a single data set when MCMC is on, otherwise from the periodogram). The search stops at the first signal below the threshold; the most plausible number of signals is the number accepted, at most the maximum.')
             )
-        }
+        )
     })
 
     output$noise.model <- renderUI({
@@ -137,9 +135,9 @@ The BFP and MLP can be compared with the Lomb-Scargle periodogram (LS), the gene
     output$gp.par <- renderUI({
         if(is.null(input$noise.model) || input$noise.model!='GP') return()
         tagList(
-            numericInput('gp.Prot','GP oscillation period [time unit of the data] (quasi-periodicity of the correlated noise, e.g. a stellar rotation period from photometry; leave empty to fit it)',value=NA,min=0),
+            numericInput('gp.Prot','GP natural SHO period [time unit of the data] (quasi-periodicity of the correlated noise, e.g. a stellar rotation period from photometry; leave empty to fit it)',value=NA,min=0),
             numericInput('gp.tau','GP damping time scale [time unit of the data] (how long correlations stay coherent, e.g. an active-region lifetime; leave empty to fit it)',value=NA,min=0),
-            helpText('The GP amplitude is always fitted. If the damping time scale is much shorter than the oscillation period the kernel is overdamped and the period is not constrained. With the Stochastic signal type the oscillation period is scanned and a fixed value is ignored.')
+            helpText('The GP amplitude is always fitted. The period parameter is 2*pi/omega0, the natural SHO period. For Q = pi*damping_time/period < 0.5 the kernel is overdamped and has no oscillation. With the Stochastic signal type this natural period is scanned and a fixed value is ignored.')
         )
     })
 
@@ -174,9 +172,9 @@ The BFP and MLP can be compared with the Lomb-Scargle periodogram (LS), the gene
     output$gp.par2 <- renderUI({
         if(is.null(input$noise.model2) || input$noise.model2!='GP') return()
         tagList(
-            numericInput('gp.Prot2','GP oscillation period [time unit of the data] (leave empty to fit it in every window)',value=NA,min=0),
+            numericInput('gp.Prot2','GP natural SHO period [time unit of the data] (leave empty to fit it in every window)',value=NA,min=0),
             numericInput('gp.tau2','GP damping time scale [time unit of the data] (leave empty to fit it)',value=NA,min=0),
-            helpText('The GP hyperparameters are fitted inside each moving window; fixing the oscillation period (e.g. from photometry) makes the windows comparable and much faster. BFP with a GP is slow: each window is a full scan.')
+            helpText('The GP hyperparameters are fitted inside each moving window; fixing the natural period (e.g. a reference scale from photometry) makes the windows comparable and much faster. BFP with a GP is slow: each window is a full scan.')
         )
     })
 
@@ -222,14 +220,20 @@ The BFP and MLP can be compared with the Lomb-Scargle periodogram (LS), the gene
     })
 
     output$nh <- renderUI({
-        if(is.null(input$per.type)) return()
-        if(any(input$per.type=='MLP'|input$per.type=='BFP')){
+        # Keep the control mounted: changing the method must not reset Nh.
+        conditionalPanel("['BFP', 'MLP'].indexOf(input['per.type']) >= 0 && input['signal.type'] !== 'stochastic'",
             selectizeInput('Nh','Number of harmonics of the signal (2 or more fits eccentric orbits)',choices=1:4,selected=2,multiple=FALSE)
-        }
+        )
     })
 
     output$mcf <- renderUI({
         if(is.null(input$per.type)) return()
+        if(identical(input$noise.model,'GP') && length(input$per.target)==1){
+            return(tagList(
+                selectizeInput('Niter','MCMC sample size',choices=0,selected=0,multiple=FALSE),
+                helpText('Single-data-set GP fits provide maximum-likelihood results only; GP MCMC is not implemented.')
+            ))
+        }
 #        if(!is.null(data())){
         if(any(input$per.type=='BFP')){
             choices <- c(0,100,1000,10000,100000,1000000)
@@ -272,19 +276,14 @@ The BFP and MLP can be compared with the Lomb-Scargle periodogram (LS), the gene
                         choices=c('BFP','MLP'),selected="BFP",multiple=FALSE)
         }else{
             selectInput("per.type",'Periodogram type',
-                        choices=c('BFP','MLP','GLST','BGLS','GLS','LS'),selected="BFP",multiple=TRUE)
+                        choices=c('BFP','MLP','GLST','BGLS','GLS','LS'),selected="BFP",multiple=FALSE)
         }
     })
 
     output$per.type2 <- renderUI({
         if(is.null(Ntarget2())) return()
-        if(Ntarget2()>1){
-###one type at a time for combined sets (the combined series is analysed white)
-            selectInput("per.type2",'Periodogram type',choices=c('BFP','MLP','GLST','BGLS','GLS','LS'),selected="MLP",multiple=FALSE)
-        }else{
-            selectInput("per.type2",'Periodogram type',
-                        choices=c('BFP','MLP','GLST','BGLS','GLS','LS'),selected="MLP",multiple=TRUE)
-        }
+        selectInput("per.type2",'Periodogram type',
+                    choices=c('BFP','MLP','GLST','BGLS','GLS','LS'),selected="MLP",multiple=FALSE)
     })
 
     output$text2D <- renderText({
@@ -296,14 +295,14 @@ The BFP and MLP can be compared with the Lomb-Scargle periodogram (LS), the gene
 #        if(all(NI.max()==0)) return()
         if(!any(input$per.type=='BFP' | input$per.type=='MLP')) return()
         lapply(1:Ntarget(),function(i){
-            selectInput(paste0('Inds',i),paste('Noise proxies for',input$per.target[i]),choices = 0:NI.max()[input$per.target[i]],selected = 0,multiple=TRUE)
+            selectizeInput(paste0('Inds',i),paste('Noise proxies for',input$per.target[i]),choices = agatha.proxy.choices(data()[[input$per.target[i]]]),selected = 0,multiple=TRUE,options=agatha.proxy.options())
         })
     })
 
     output$Inds2 <- renderUI({
         if(is.null(data()) | is.null(input$per.target2)) return()
         lapply(1:Ntarget2(),function(i){
-            selectInput(paste0("Inds2.",i),paste('Noise proxies for',input$per.target2[i]),choices = 0:NI.max()[input$per.target2[i]],selected = 0,multiple=TRUE)
+            selectizeInput(paste0("Inds2.",i),paste('Noise proxies for',input$per.target2[i]),choices = agatha.proxy.choices(data()[[input$per.target2[i]]]),selected = 0,multiple=TRUE,options=agatha.proxy.options())
         })
     })
 
@@ -330,8 +329,7 @@ The BFP and MLP can be compared with the Lomb-Scargle periodogram (LS), the gene
       if(any(NI.max()[input$comp.target]>0)){
           radioButtons("proxy.type",'Type of proxy comparison',c("Cumulative"="cum","Group"='group','Manual'='man'))
       }else{
-          output$warn <- renderText({'No indices available for comparison!'})
-          verbatimTextOutput("warn")
+          helpText('No activity indices in this data set. AR/MA noise models can still be compared without proxies.')
       }
   })
 
@@ -355,8 +353,8 @@ The BFP and MLP can be compared with the Lomb-Scargle periodogram (LS), the gene
         if(is.null(input$proxy.type) | is.null(input$Nman)) return()
         if(input$proxy.type=='man' & NI.max()[input$comp.target]>0){
             lapply(1:as.integer(input$Nman), function(i) {
-                selectInput(paste0("NI.man",i),paste0('proxy group ',i),
-                            choices=0:NI.max()[input$comp.target],multiple = TRUE)
+                selectizeInput(paste0("NI.man",i),paste0('proxy group ',i),
+                            choices=agatha.proxy.choices(data()[[input$comp.target]]),selected=0,multiple=TRUE,options=agatha.proxy.options())
             })
         }
     })
@@ -419,6 +417,13 @@ The BFP and MLP can be compared with the Lomb-Scargle periodogram (LS), the gene
             }
             df[[i]] <- read.agatha.table(f0,center.rv=FALSE)
         }
+    }
+    for(name in names(df)){
+        status <- agatha.proxy.status(df[[name]])
+        bad <- status[!status$regression.usable,,drop=FALSE]
+        if(nrow(bad)>0) showNotification(paste0(name,': activity values were preserved; unavailable RV regressors: ',
+            paste(paste0(bad$index,': ',bad$name,' (',bad$status,')'),collapse='; '),
+            '. Diagnosis uses finite activity subsets when available.'),type='warning',duration=NULL)
     }
     return(df)
 })
@@ -685,6 +690,7 @@ The BFP and MLP can be compared with the Lomb-Scargle periodogram (LS), the gene
           vals <- c(vals,Nmas=0,Nars=0,Inds=0)
       }
       if(vals$SigType=='stochastic'){
+          vals$sequence <- FALSE
           vals$Nsig.max <- 1
 	  vals$per.type.seq <- vals$per.type
       }else if(!vals$sequence){
@@ -704,7 +710,7 @@ The BFP and MLP can be compared with the Lomb-Scargle periodogram (LS), the gene
                            a=suppressWarnings(as.numeric(iget('e.beta.a',0.867))),
                            b=suppressWarnings(as.numeric(iget('e.beta.b',3.03))),
                            sigma=suppressWarnings(as.numeric(iget('e.sigma',0.1))))
-      vals$Nh <- as.integer(iget('Nh',1))
+      vals$Nh <- if(vals$SigType=='stochastic') 1L else as.integer(iget('Nh',1))
       vals$noise.model <- if(is.null(input$noise.model)) 'ARMA' else input$noise.model
       vals$gp.Prot <- if(is.null(input$gp.Prot)) NA else suppressWarnings(as.numeric(input$gp.Prot))
       vals$gp.tau <- if(is.null(input$gp.tau)) NA else suppressWarnings(as.numeric(input$gp.tau))
@@ -752,7 +758,12 @@ The BFP and MLP can be compared with the Lomb-Scargle periodogram (LS), the gene
         }else{
             Nbasic <- 0
         }
-        if(!is.null(input$proxy.type)){
+        if(ncol(tab)<=3){
+            Nbasic <- 0
+            groups <- NULL
+            proxy.type <- 'cum'
+            ni <- 0
+        }else if(!is.null(input$proxy.type)){
             if(input$proxy.type=='group'){
                 groups <- input$NI.group
                 proxy.type <- 'group'
@@ -996,6 +1007,8 @@ output$color <- renderUI({
     })
 
     save.data <- function(li,f,format='normal'){
+        li <- Filter(function(x) !is.null(x) && length(x)>0,li)
+        if(length(li)==0) return(character())
         fs <- c()
         if(length(li)==1){
             if(format=='normal'){
@@ -1003,7 +1016,7 @@ output$color <- renderUI({
             }else{
                 tab <- li[[1]]
                 if(is.null(dim(tab))){
-                    write.table(t(tab), f,quote=FALSE,row.names=FALSE)
+                    write.csv(as.data.frame(t(tab)), f,quote=FALSE,row.names=FALSE)
                 }else{
                     write.csv(tab, f,quote=FALSE,row.names=TRUE)
                 }
@@ -1017,7 +1030,7 @@ output$color <- renderUI({
                 }else{
                     tab <- li[[j]]
                     if(is.null(dim(tab))){
-                        write.table(t(tab), file=ff,quote=FALSE,row.names=FALSE)
+                        write.csv(as.data.frame(t(tab)), file=ff,quote=FALSE,row.names=FALSE)
                     }else{
                         write.csv(tab, file=ff,quote=FALSE,row.names=TRUE)
                     }
@@ -1033,14 +1046,21 @@ output$color <- renderUI({
             paste0(data1D()$fname,'.zip')
         },
         content = function(file) {
-        tmpdir <- tempdir()
-        setwd(tempdir())
+        tmpdir <- tempfile('agatha-export-')
+        dir.create(tmpdir)
+        oldwd <- getwd()
+        on.exit({setwd(oldwd); unlink(tmpdir,recursive=TRUE)},add=TRUE)
+        setwd(tmpdir)
         fs <- c()
         fs <- c(fs,save.data(data1D()$per.list,paste0(data1D()$fname,'_Periodogram.txt')))
         fs <- c(fs,save.data(data1D()$phase.list,paste0(data1D()$fname,'_PhaseData.txt')))
         fs <- c(fs,save.data(data1D()$mc.list,paste0(data1D()$fname,'_MCposterior.txt')))
+        fs <- c(fs,save.mc.audit(data1D()$mc.list,data1D()$fname))
         fs <- c(fs,save.data(data1D()$sim.list,paste0(data1D()$fname,'_SimFit.txt')))
         fs <- c(fs,save.data(data1D()$par.list,paste0(data1D()$fname,'_OptPar.csv'),format='csv'))
+        settings.file <- paste0(data1D()$fname,'_Settings.json')
+        jsonlite::write_json(data1D()$settings,settings.file,auto_unbox=TRUE,pretty=TRUE,na='null',null='null',digits=NA)
+        fs <- c(fs,settings.file)
 #        save(list=ls(all=TRUE),file='test0.Robj')
         zip(zipfile=file, files=fs)
       },
@@ -1283,7 +1303,7 @@ output$color <- renderUI({
 
     output$nbody.source <- renderUI({
         o <- nbody.orbits()
-        if(is.null(o) || is.null(o$orb)) return(helpText('Compute a 1D periodogram with a Keplerian (or circular) signal first; its fitted parameters (the MAP of the MCMC when it ran) define the planets.'))
+        if(is.null(o) || is.null(o$orb)) return(helpText('Compute a 1D periodogram with a Keplerian (or circular) signal first; its fitted parameters (the fitted point estimates (highest-likelihood sample when a joint MCMC sample exists)) define the planets.'))
         n <- nrow(o$orb)
         helpText(paste0(n,' planet',if(n>1) 's' else '',' from the 1D fit of ',o$ypar,': P = ',paste(signif(o$orb$P,4),collapse=', '),' d; ',
                         'a = ',paste(signif(o$orb$a,3),collapse=', '),' AU; m sin i = ',paste(signif(o$orb$msini,3),collapse=', '),' Mjup. ',
@@ -1312,7 +1332,7 @@ output$color <- renderUI({
         o <- nbody.orbits(); if(is.null(o) || is.null(o$orb) || nrow(o$orb)<2) return(NULL)
         tab <- amd.stability(o$orb,Mstar=as.numeric(input$nbody.Mstar))
         tab$AMD.stable <- ifelse(tab$AMD.stable,'yes','no'); tab$Hill.stable <- ifelse(tab$Hill.stable,'yes','no')
-        colnames(tab) <- c('Pair','a inner [AU]','a outer [AU]','Relative AMD','Critical (collision)','Critical (Hill)','AMD ratio','Separation [mutual Hill radii]','AMD-stable','Hill-stable (> 2 sqrt 3)')
+        colnames(tab) <- c('Pair','a inner [AU]','a outer [AU]','Relative AMD','Critical (collision)','Critical (Hill)','AMD ratio','AMD ratio status','Separation [mutual Hill radii]','AMD-stable','Hill-stable (> 2 sqrt 3)')
         tab
     },digits=3,caption='Analytical criteria for adjacent pairs (nominal orbits)',caption.placement='top')
 
@@ -1390,7 +1410,10 @@ output$color <- renderUI({
         nom <- cls[1,]
         tagList(h4(paste0('Nominal solution: ',nom$status,if(!nom$stable) paste0(' at ',signif(nom$t.end,3),' yr') else paste0(' over ',format(r$tmax,big.mark=','),' yr'))),
                 helpText(paste0(r$run$engine,'; ',r$method,'. Energy error of the nominal run: ',signif(nom$dE,2),
-                                '. A system is unstable at an escape, a close encounter within the chosen number of mutual Hill radii, a drift of a semi-major axis beyond the tolerance, or e > 0.9.')),
+                                '. The integration fails the screening criteria at an escape, close encounter or excessive semi-major-axis drift. Exceeding e = 0.9 is reported separately; it does not alone establish instability.')),
+                if('screening.failure.time'%in%names(nom) && is.finite(nom$screening.failure.time))
+                    helpText(paste0('Earliest reported screening failure: ',signif(nom$screening.failure.time,6),
+                                    ' yr. Backend stop and first saved drift exceedance are listed separately below; saved-output times do not locate a continuous-time crossing exactly.')),
                 if(nrow(cls)>1) h4(paste0(sum(cls$stable[-1]),' of ',nrow(cls)-1,' sampled systems stable')))
     })
 
@@ -1399,7 +1422,11 @@ output$color <- renderUI({
         cls <- r$class
         cls$system <- c('nominal',if(nrow(cls)>1) paste('sample',seq_len(nrow(cls)-1)))
         cls$stable <- ifelse(cls$stable,'yes','no')
-        colnames(cls) <- c('System','Status','End time [yr]','max |da/a|','max e','Energy error','Stable')
+        labels <- c(system='System',status='Status',t.end='Classification event [yr]',max.da='max |da/a|',max.e='max e',
+                    dE='Energy error',stable='Passes screening over run',eccentricity.limit.exceeded='e limit exceeded',
+                    backend.status='Backend stop status',backend.t.end='Backend stop [yr]',
+                    first.saved.drift.time='First saved drift exceedance [yr]',screening.failure.time='Earliest reported screening failure [yr]')
+        colnames(cls) <- unname(labels[names(cls)])
         cls
     },digits=3,caption='Integrated systems',caption.placement='top')
 
@@ -1469,7 +1496,9 @@ output$color <- renderUI({
         tagList(h4(paste0('Signals in ',paste(set.label(d$sets),collapse=' + '),' (',d$noise.models[1],' noise): ',n,' accepted')),
                 helpText(paste0('Accepted periods: ',if(n>0) paste(signif(d$periods,5),collapse=', ') else 'none',
                                 ' d. The table applies the criteria of Feng et al. (2020): ln(BF) > ',d$lnBF.min,
-                                ' under every noise model, no activity index peaking within 10 per cent of the period, and the signal above the threshold in most windows of the moving periodogram (the time-consistency test is not applied to periods longer than half the time span).')))
+                                ' under every noise model, no activity index peaking within 10 per cent of the period, and the signal above the threshold in most windows of the moving periodogram (the time-consistency test is not applied to periods longer than half the time span).')),
+                helpText(paste0('Cross-model matching uses accepted candidates only, with at most ',d$Nsig.max,
+                                ' signals per model. An unmatched candidate makes the robustness check inconclusive; NA does not mean there is no local peak. For an unmatched candidate the table also reports the local maximum within 10% in the last available search scan, identified by its column name. This scan can precede subtraction of the last accepted signal; a local peak is not a newly fitted or accepted signal.')))
     })
 
     output$diag.summary <- renderTable({
@@ -1495,7 +1524,7 @@ output$color <- renderUI({
                 kk <- k
                 output[[paste0('diag.mp',kk)]] <- renderPlot({
                     if(is.null(d$moving[[kk]])) return()
-                    plotMP(d$moving[[kk]],d$moving.par)
+                    plotMP(d$moving[[kk]],diagnosis.moving.par(d,kk,input$mp.min3,input$mp.max3))
                 })
             })
         }
@@ -1519,7 +1548,8 @@ output$color <- renderUI({
             lay <- diagnosis.layout(d,nc)
             pdf(file,width=3.3*nc,height=2.9*sum(lay$heights))
             diagnosis.plot(d,ncol=nc,Prot=suppressWarnings(as.numeric(input$Prot3)))
-            for(mv in d$moving) if(!is.null(mv)) plotMP(mv,d$moving.par)
+            for(k in seq_along(d$moving)) if(!is.null(d$moving[[k]]))
+                plotMP(d$moving[[k]],diagnosis.moving.par(d,k,input$mp.min3,input$mp.max3))
             dev.off()
         })
 

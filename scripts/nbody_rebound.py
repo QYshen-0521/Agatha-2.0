@@ -51,11 +51,11 @@ def report(cfg, isys, nsys, frac):
 
 def hill_min(sim):
     """the smallest mutual Hill radius of adjacent planets"""
-    ps = sorted(sim.particles[1:], key=lambda p: p.a)
+    ps = sorted(sim.particles[1:], key=lambda p: p.orbit(primary=sim.particles[0]).a)
     M = sim.particles[0].m
     rh = []
     for p1, p2 in zip(ps[:-1], ps[1:]):
-        rh.append(((p1.m + p2.m) / (3.0 * M)) ** (1.0 / 3.0) * 0.5 * (p1.a + p2.a))
+        rh.append(((p1.m + p2.m) / (3.0 * M)) ** (1.0 / 3.0) * 0.5 * (p1.orbit(primary=sim.particles[0]).a + p2.orbit(primary=sim.particles[0]).a))
     return min(rh) if rh else 0.0
 
 def main():
@@ -72,14 +72,16 @@ def main():
         report(cfg, isys + off, ntot, 0.0)
         sim = rebound.Simulation()
         sim.units = ('yr', 'AU', 'Msun')
+        # Match the canonical Kepler conversion and the R backend exactly.
+        sim.G = 4.0 * math.pi**2
         sim.add(m=cfg.get('Mstar', 1.0))
         for m, a, e, omega, M, inc in planets:
-            sim.add(m=m, a=a, e=e, omega=omega, M=M, inc=inc)
+            sim.add(m=m, a=a, e=e, omega=omega, M=M, inc=inc, primary=sim.particles[0])
         sim.move_to_com()
         sim.integrator = 'whfast'
-        Pmin = min(p.P for p in sim.particles[1:])
+        Pmin = min(p.orbit(primary=sim.particles[0]).P for p in sim.particles[1:])
         sim.dt = Pmin / cfg.get('steps_per_orbit', 20)
-        amax0 = max(p.a for p in sim.particles[1:])
+        amax0 = max(p.orbit(primary=sim.particles[0]).a for p in sim.particles[1:])
         sim.exit_max_distance = cfg.get('escape_factor', 10.0) * amax0
         rh = hill_min(sim)
         if rh > 0 and cfg.get('encounter_hill', 1.0) > 0:
@@ -93,7 +95,7 @@ def main():
                 sim.integrate(t, exact_finish_time=0)
                 report(cfg, isys + off, ntot, sim.t / tmax)
                 bad = False
-                for j, o in enumerate(sim.orbits(), start=1):
+                for j, o in enumerate(sim.orbits(primary=sim.particles[0]), start=1):
                     orb.write('%d %.9g %d %.9g %.9g\n' % (isys, sim.t, j, o.a, o.e))
                     if not (o.a > 0 and o.e < 1):
                         bad = True
@@ -107,6 +109,8 @@ def main():
         except Exception as err:
             status, t_end = 'error', sim.t
             sys.stderr.write('system %d: %s\n' % (isys, err))
+        if status == 'stable':
+            t_end = sim.t
         dE = abs((sim.energy() - E0) / E0) if E0 != 0 else float('nan')
         summ.write('%d %s %.9g %.3g\n' % (isys, status, t_end, dE))
         print('system %d/%d %s t=%.4g yr' % (isys, len(cfg['systems']), status, t_end), flush=True)

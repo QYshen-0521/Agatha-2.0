@@ -577,15 +577,20 @@ ker.sho <- function(x,y,S0,logQ,logProt){
     tau <- abs(x-y)
     Q <- exp(logQ)
     w0 <- 2*pi/exp(logProt)
-    eta <- abs(1-(4*Q^2)^(-1))^0.5
-    A <- S0*w0*Q*exp(-w0*tau/(2*Q))
-    if(Q>0 & Q<1/2){
-        A*(cosh(eta*w0*tau)+sinh(eta*w0*tau)/(2*eta*Q))
-    }else if(Q==1/2){
-        A*(2*(1+w0*tau))
-    }else if(Q>1/2){
-        A*(cos(eta*w0*tau)+sin(eta*w0*tau)/(2*eta*Q))
+    if(Q<0.5){
+        # Equivalent real-exponential form: no cosh overflow at long lags,
+        # and expm1 avoids cancellation on approach to critical damping.
+        f <- sqrt(1-4*Q^2)
+        slow <- 2*w0*Q/(1+f)
+        K <- S0*w0*Q*exp(-slow*tau)*(1+0.5*(1-1/f)*expm1(-w0*f*tau/Q))
+    }else{
+        eta <- sqrt(1-1/(4*Q^2))
+        x <- eta*w0*tau
+        sinc <- x; sinc[] <- 1
+        nz <- x!=0; sinc[nz] <- sin(x[nz])/x[nz]
+        K <- S0*w0*Q*exp(-w0*tau/(2*Q))*(cos(x)+w0*tau/(2*Q)*sinc)
     }
+    K
 }
 ker.celerite <- function(x,y,term){
     a <- term[,1]
@@ -724,7 +729,7 @@ arma <- function(t,ymodel,ydata,pars,p,q,ind.set=1,ARMAtype='abs'){
         alpha <- pars[paste0('alpha',ind.set)]
         for(j in 1:p){
             ar <- phi[j]*exp((t[-(length(t)+1-(1:j))]-t[-(1:j)])/exp(alpha))*ydata[-(length(t)+1-(1:j))]
-            ar1 <- phi[j]*exp(-abs(t[j+(1:j)]-t[(1:j)])/exp(alpha))*ydata[j+(1:j)]#backward propagation for initial j epochs
+            ar1 <- rep(0,j) # No pre-observation history: never use future data.
 #            dVr.ar <- dVr.ar + c(rep(ar[1],j),ar)
             dVr.ar <- dVr.ar + c(ar1,ar)
         }
@@ -737,7 +742,7 @@ arma <- function(t,ymodel,ydata,pars,p,q,ind.set=1,ARMAtype='abs'){
         res <- ydata-ymodel
         for(j in 1:q){
             ma <- w[j]*exp(-abs(t[-(length(t)+1-(1:j))]-t[-(1:j)])/exp(beta))*res[-(length(t)+1-(1:j))]
-            ma1 <- w[j]*exp(-abs(t[j+(1:j)]-t[(1:j)])/exp(beta))*res[j+(1:j)]#backward propagation for initial j epochs
+            ma1 <- rep(0,j)
 #            dVr.ma <- dVr.ma + c(rep(ma[1],j),ma)
             dVr.ma <- dVr.ma + c(ma1,ma)
         }
@@ -952,7 +957,7 @@ eprior.logfun <- function(e){
     if(exists('e.prior') && exists('eprior.log')){
         eprior.log(e,e.prior)
     }else{
-        log(2*dnorm(e,mean=0,sd=Esd))
+        log(2)+dnorm(e,mean=0,sd=Esd,log=TRUE)
     }
 }
 
@@ -1442,7 +1447,7 @@ ptmcmc.rhat <- function(mcmc,Nsub=5){
 run.ptmcmc <- function(startvalue,cov.start,iterations,n0=NULL,verbose=FALSE,bases='natural',
                        tems=NULL,Ntem=NULL,tem.min=NULL,swap.interval=10,nburn=NULL,
                        sd.ini=0.05,acc.target=0.234,adapt.ladder=TRUE,adapt.window=100,
-                       adapt.nu=100,adapt.t0=1000,max.extend=3,Rhat.max=1.1,progress=NULL){
+                       adapt.nu=100,adapt.t0=1000,max.extend=3,Rhat.max=1.1,progress=NULL,audit.covariance=FALSE){
 ###progress: optional callback(frac.done.increment, detail) for a UI progress
 ###bar; only useful when the sampler runs in the interface's own process
 ###Each replica is an adaptive Metropolis chain sampling posterior(.,tem) with its
@@ -1460,6 +1465,7 @@ run.ptmcmc <- function(startvalue,cov.start,iterations,n0=NULL,verbose=FALSE,bas
 ###  max.extend    if the cold chain has not converged (split Rhat>Rhat.max) after
 ###                the requested length, sampling continues in blocks, up to
 ###                max.extend times the post-burn-in length
+    if(audit.covariance && max.extend!=0) stop('Covariance history auditing requires max.extend=0.',call.=FALSE)
     Npar <- length(startvalue)
     auto.tem <- is.null(tem.min)
     if(auto.tem) tem.min <- ptmcmc.temmin(startvalue,bases)
@@ -1483,11 +1489,25 @@ run.ptmcmc <- function(startvalue,cov.start,iterations,n0=NULL,verbose=FALSE,bas
         lp.cur[k] <- pp$logprior
     }
     mu <- par.cur
-    cov.ini <- diag((sd.ini*box)^2,nrow=Npar)
-    if(any(!is.finite(cov.ini))) cov.ini <- cov.start
+    # NULL explicitly uses the caller's covariance; the default still uses
+    # the historical fraction of the prior box.
+    if(is.null(sd.ini)){
+        if(!is.matrix(cov.start) || !all(dim(cov.start)==c(Npar,Npar)) ||
+           any(!is.finite(cov.start)) || inherits(try(chol(cov.start),silent=TRUE),'try-error')){
+            stop('cov.start must be a finite positive-definite Npar x Npar matrix')
+        }
+        cov.ini <- cov.start
+    }else{
+        cov.ini <- diag((sd.ini*box)^2,nrow=Npar)
+        if(any(!is.finite(cov.ini))) cov.ini <- cov.start
+    }
     cov.adapt <- lapply(1:Nt,function(k) cov.ini)
     lambda <- rep(1,Nt)
-    head.store <- lapply(1:Nt,function(k) matrix(NA,nrow=n0,ncol=Npar))
+    # Running covariance of complete post-swap states, not an unfinished buffer.
+    n.stat <- rep(0L,Nt)
+    M2 <- lapply(1:Nt,function(k) matrix(0,Npar,Npar))
+    Sd.pt <- 2.4^2/Npar
+    history <- if(audit.covariance) array(NA_real_,c(iterations,Nt,Npar)) else NULL
     naccept <- nnull <- rep(0,Nt)
     Nswap <- max(1,Nt-1)
     nswap <- nswap.acc <- rep(0,Nswap)
@@ -1502,10 +1522,8 @@ run.ptmcmc <- function(startvalue,cov.start,iterations,n0=NULL,verbose=FALSE,bas
         for(ib in 1:n){
             i <<- i+1
             for(k in 1:Nt){
-                if(i==n0){
-                    cov.adapt[[k]] <<- covariance.n0(mat=head.store[[k]])
-                }else if(i>n0){
-                    cov.adapt[[k]] <<- covariance.rep(par.cur[k,],cov.adapt[[k]],mu[k,],i)
+                if(n.stat[k]>=n0){
+                    cov.adapt[[k]] <<- Sd.pt*(M2[[k]]/(n.stat[k]-1)+tol1*diag(Npar))
                 }
                 cov.adapt[[k]] <<- ptmcmc.cov(cov.adapt[[k]],cov.ini)
                 proposal <- ptmcmc.proposal(par.cur[k,],lambda[k]*cov.adapt[[k]])
@@ -1526,8 +1544,6 @@ run.ptmcmc <- function(startvalue,cov.start,iterations,n0=NULL,verbose=FALSE,bas
                 }
                 gam <- min(0.5,i^(-0.6))
                 lambda[k] <<- min(max(exp(log(lambda[k])+gam*(acc-acc.target)),1e-8),1e4)
-                if(i<=n0) head.store[[k]][i,] <<- par.cur[k,]
-                mu[k,] <<- (mu[k,]*i+par.cur[k,])/(i+1)
             }
 ###replica exchange between neighbouring temperatures; the priors cancel
             if(Nt>1 & i%%swap.interval==0){
@@ -1564,6 +1580,13 @@ run.ptmcmc <- function(startvalue,cov.start,iterations,n0=NULL,verbose=FALSE,bas
                 tems <<- 1/Tnew
                 win.n <<- win.acc <<- rep(0,Nswap)
             }
+            for(k in 1:Nt){
+                n.stat[k] <<- n.stat[k]+1L
+                delta <- par.cur[k,]-mu[k,]
+                mu[k,] <<- mu[k,]+delta/n.stat[k]
+                M2[[k]] <<- M2[[k]]+tcrossprod(delta,par.cur[k,]-mu[k,])
+            }
+            if(audit.covariance) history[i,,] <<- par.cur
             chain[ib,] <- par.cur[1,]
             logpost[ib] <- lp.cur[1]+ll.cur[1]
             loglike[ib] <- ll.cur[1]
@@ -1594,7 +1617,10 @@ run.ptmcmc <- function(startvalue,cov.start,iterations,n0=NULL,verbose=FALSE,bas
     return(list(out=out,Rhat=Rhat,conv=conv,acc=100*naccept[1]/i,tems=tems,tems.initial=tems0,
                 tem.min=tem.min,auto.tem=auto.tem,Ntem=Nt,extended=extended,iterations=i,
                 swap.rate=nswap.acc/pmax(nswap,1),acc.all=100*naccept/i,
-                null.rate=100*nnull/i,lambda=lambda))
+                null.rate=100*nnull/i,lambda=lambda,
+                warmup.iterations=nburn,initialization.iterations=n0,
+                adaptation=list(method='Welford_complete_postswap_history',counts=n.stat,mean=mu,
+                  covariance=lapply(1:Nt,function(k)M2[[k]]/(n.stat[k]-1)),history=history)))
 }
 
 bin.simple <- function(data,Nbin){
@@ -1733,8 +1759,8 @@ data.distr <- function(x,lp=NULL,xlab,ylab,main='',oneside=FALSE,plotf=TRUE){
     if(plotf){
         if(!oneside){
             legend('topleft',legend=c(as.expression(bquote('mode ='~.(format(x1,digit=3)))),as.expression(bquote(mu~'='~.(format(x2,digit=3)))),as.expression(bquote(sigma~'='~.(format(x3,digit=3))))),bty='n')
-#            legend('topright',legend=c(as.expression(bquote('MAP ='~.(format(xopt,digit=3)))),as.expression(bquote(mu^3~'='~.(format(x4,digit=3)))),as.expression(bquote(mu^4~'='~.(format(x5,digit=3))))),bty='n')
-            legend('topright',legend=c(as.expression(bquote('MAP ='~.(format(xopt,digit=3)))),as.expression(bquote(q[10]~'='~.(format(x10per,digit=3)))),as.expression(bquote(q[90]~'='~.(format(x90per,digit=3))))),bty='n')
+#            legend('topright',legend=c(as.expression(bquote('Selected sample ='~.(format(xopt,digit=3)))),as.expression(bquote(mu^3~'='~.(format(x4,digit=3)))),as.expression(bquote(mu^4~'='~.(format(x5,digit=3))))),bty='n')
+            legend('topright',legend=c(as.expression(bquote('Selected sample ='~.(format(xopt,digit=3)))),as.expression(bquote(q[10]~'='~.(format(x10per,digit=3)))),as.expression(bquote(q[90]~'='~.(format(x90per,digit=3))))),bty='n')
         }else{
             legend('topleft',legend=c(as.expression(bquote('mode ='~.(format(x1,digit=3)))),as.expression(bquote(mu~'='~.(format(x2,digit=3)))),as.expression(bquote(sigma~'='~.(format(x3,digit=3)))),as.expression(bquote(mu^3~'='~.(format(x4,digit=3)))),as.expression(bquote(mu^4~'='~.(format(x5,digit=3))))),bty='n')
         }
@@ -1775,8 +1801,8 @@ matrix.distr <- function(y,lp=NULL,xlab,ylab,main='',oneside=FALSE,plotf=TRUE){
         if(plotf){
             if(!oneside){
                 legend('topleft',legend=c(as.expression(bquote('mode ='~.(format(x1,digit=3)))),as.expression(bquote(mu~'='~.(format(x2,digit=3)))),as.expression(bquote(sigma~'='~.(format(x3,digit=3))))),bty='n')
-                                        #            legend('topright',legend=c(as.expression(bquote('MAP ='~.(format(xopt,digit=3)))),as.expression(bquote(mu^3~'='~.(format(x4,digit=3)))),as.expression(bquote(mu^4~'='~.(format(x5,digit=3))))),bty='n')
-                legend('topright',legend=c(as.expression(bquote('MAP ='~.(format(xopt,digit=3)))),as.expression(bquote(q[10]~'='~.(format(x10per,digit=3)))),as.expression(bquote(q[90]~'='~.(format(x90per,digit=3))))),bty='n')
+                                        #            legend('topright',legend=c(as.expression(bquote('Selected sample ='~.(format(xopt,digit=3)))),as.expression(bquote(mu^3~'='~.(format(x4,digit=3)))),as.expression(bquote(mu^4~'='~.(format(x5,digit=3))))),bty='n')
+                legend('topright',legend=c(as.expression(bquote('Selected sample ='~.(format(xopt,digit=3)))),as.expression(bquote(q[10]~'='~.(format(x10per,digit=3)))),as.expression(bquote(q[90]~'='~.(format(x90per,digit=3))))),bty='n')
             }else{
                 legend('topleft',legend=c(as.expression(bquote('mode ='~.(format(x1,digit=3)))),as.expression(bquote(mu~'='~.(format(x2,digit=3)))),as.expression(bquote(sigma~'='~.(format(x3,digit=3)))),as.expression(bquote(mu^3~'='~.(format(x4,digit=3)))),as.expression(bquote(mu^4~'='~.(format(x5,digit=3))))),bty='n')
             }

@@ -86,6 +86,7 @@ for(jj in 2:Nsig.max){
     ylabs <- c(ylabs,ylab)
     lnBF.per <- if(per.type.seq=='BFP') suppressWarnings(max(rv.ls$power,na.rm=TRUE)) else NA
     if(!is.finite(lnBF.per)) lnBF.per <- NA
+    score.period <- if(is.finite(lnBF.per)) as.numeric(rv.ls$P[which.max(rv.ls$power)]) else NA_real_
 ###modify the periodogram output for Keplerian fit
     tmp <- sigfit(per=rv.ls,data=cbind(t,rr,dy),SigType=SigType,basis=basis,mcf=mcf,Niter=Niter,Ncores=Ncores,Pconv=Pconv,
                   e.prior=if(exists('e.prior')) e.prior else NULL)
@@ -104,11 +105,12 @@ for(jj in 2:Nsig.max){
             dk <- length(fitj$ParSig)-length(par.prev)
             lnBF <- as.numeric(fitj$llmax-llmax.prev-dk/2*log(length(t)))
             lnBF.source <- 'MCMC'
+            score.period <- as.numeric(fitj$ParSig[paste0('P',jj)])
         }
     }
     accepted <- is.na(lnBF) || lnBF>lnBF.min
     if(!is.null(model.comp)){
-        model.comp <- rbind(model.comp,data.frame(n=jj,P=as.numeric(tmp$popt)[1],lnBF=lnBF,source=lnBF.source,accepted=accepted,stringsAsFactors=FALSE))
+        model.comp <- rbind(model.comp,data.frame(n=jj,P=as.numeric(tmp$popt)[1],P_score=score.period,lnBF=lnBF,source=lnBF.source,accepted=accepted,stringsAsFactors=FALSE))
     }
     cat(' Signal ',jj,': ln(BF) = ',format(lnBF,digits=3),' (',lnBF.source,'); ',if(accepted) 'accepted' else 'rejected','\n',sep='')
     if(!accepted) break
